@@ -63,7 +63,7 @@ esac
 install_docker() {
   info ""
   info "📥 新电脑未安装 Docker Desktop，正在从 Docker 官方下载……"
-  TMP_DMG="$(mktemp "${TMPDIR:-/tmp}/Docker.XXXXXX.dmg")" || fail "无法创建Docker临时文件。"
+  TMP_DMG="$(mktemp "${TMPDIR:-/tmp}/Docker.XXXXXX")" || fail "无法创建Docker临时文件。"
 
   curl --fail --location --retry 3 --connect-timeout 20 \
     --progress-bar "$DOCKER_URL" -o "$TMP_DMG" || fail "Docker下载失败，请检查网络或代理。"
