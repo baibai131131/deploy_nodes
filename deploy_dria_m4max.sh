@@ -25,6 +25,7 @@ printf 'M4 Max 模式：qwen3.5:9b + lfm2.5:1.2b，并发 2。\n\n'
 
 export DRIA_MODEL="qwen3.5:9b,lfm2.5:1.2b"
 export DRIA_MAX_CONCURRENT="2"
+export DRIA_INSTALL_PROFILE="m4max"
 
 bash <(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
   https://raw.githubusercontent.com/baibai131131/deploy_nodes/refs/heads/main/deploy_dria.sh)
