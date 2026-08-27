@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 OFFICIAL_REPO="firstbatchxyz/dkn-compute-node"
 OFFICIAL_API="https://api.github.com/repos/${OFFICIAL_REPO}/releases/latest"
 RAW_SELF_URL="https://raw.githubusercontent.com/baibai131131/deploy_nodes/refs/heads/main/deploy_dria.sh"
@@ -15,7 +15,6 @@ ENV_FILE="${APP_DIR}/node.env"
 RUN_FILE="${APP_DIR}/run.sh"
 LOG_DIR="${HOME}/Library/Logs"
 OUT_LOG="${LOG_DIR}/DriaNode.log"
-ERR_LOG="${LOG_DIR}/DriaNode.error.log"
 PLIST="${HOME}/Library/LaunchAgents/com.baibai.dria-node.plist"
 LABEL="com.baibai.dria-node"
 INSTALL_DIR="${APP_DIR}/bin"
@@ -141,17 +140,25 @@ valid_model() {
   esac
 }
 
+valid_model_list() {
+  local list="$1" item
+  [ -n "$list" ] || return 1
+  while IFS= read -r item; do
+    [ -n "$item" ] && valid_model "$item" || return 1
+  done < <(printf '%s' "$list" | tr ',' '\n')
+}
+
 select_model() {
   local existing="" bytes="" gb=0 chosen=""
   if [ -n "${DRIA_MODEL:-}" ]; then
     chosen="$DRIA_MODEL"
-    valid_model "$chosen" || die "DRIA_MODEL=${chosen} 不是当前脚本支持的官方模型名。"
+    valid_model_list "$chosen" || die "DRIA_MODEL=${chosen} 包含当前脚本不支持的官方模型名。"
     printf '%s' "$chosen"
     return 0
   fi
 
   existing="$(read_env_value "$ENV_FILE" DRIA_MODELS 2>/dev/null || true)"
-  if valid_model "$existing"; then
+  if valid_model_list "$existing"; then
     # v1.2.0 used qwen3.5:0.8b as its automatic default. Move only that
     # old default to the M4-tested text model; preserve every manually chosen
     # model and every later explicit DRIA_MODEL override.
@@ -233,7 +240,7 @@ install_official_binary() {
 }
 
 write_config() {
-  local wallet="$1" model="$2"
+  local wallet="$1" model="$2" concurrency="$3"
   mkdir -p "$APP_DIR" "$LOG_DIR" "$(dirname "$PLIST")"
   chmod 700 "$APP_DIR"
 
@@ -242,7 +249,7 @@ write_config() {
     printf 'DRIA_WALLET=%s\n' "$wallet"
     printf 'DRIA_MODELS=%s\n' "$model"
     printf 'DRIA_GPU_LAYERS=-1\n'
-    printf 'DRIA_MAX_CONCURRENT=1\n'
+    printf 'DRIA_MAX_CONCURRENT=%s\n' "$concurrency"
     printf 'DRIA_DATA_DIR="$HOME/.dria"\n'
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -278,7 +285,7 @@ write_launch_agent() {
   <key>StandardOutPath</key>
   <string>${OUT_LOG}</string>
   <key>StandardErrorPath</key>
-  <string>${ERR_LOG}</string>
+  <string>${OUT_LOG}</string>
 </dict>
 </plist>
 PLIST_EOF
@@ -290,57 +297,24 @@ write_desktop_helpers() {
   local desktop="${HOME}/Desktop"
   [ -d "$desktop" ] || return 0
 
-  cat > "${desktop}/Dria_Start.command" <<EOF
-#!/bin/bash
-domain="gui/\$(id -u)"
-launchctl print "\$domain" >/dev/null 2>&1 || domain="user/\$(id -u)"
-launchctl bootstrap "\$domain" "$PLIST" 2>/dev/null || true
-launchctl kickstart -k "\$domain/$LABEL"
-echo "Dria 节点已启动。"
-read -r -p "按回车关闭窗口……"
-EOF
-
-  cat > "${desktop}/Dria_Stop.command" <<EOF
-#!/bin/bash
-domain="gui/\$(id -u)"
-launchctl print "\$domain" >/dev/null 2>&1 || domain="user/\$(id -u)"
-launchctl bootout "\$domain" "$PLIST" 2>/dev/null || true
-echo "Dria 节点已停止。"
-read -r -p "按回车关闭窗口……"
-EOF
-
-  cat > "${desktop}/Dria_Status.command" <<EOF
-#!/bin/bash
-domain="gui/\$(id -u)"
-launchctl print "\$domain/$LABEL" 2>/dev/null || echo "Dria 服务当前未运行。"
-echo
-echo "最近日志："
-tail -n 40 "$OUT_LOG" "$ERR_LOG" 2>/dev/null || true
-read -r -p "按回车关闭窗口……"
-EOF
+  # Keep the desktop clean: remove helpers created by older script versions.
+  rm -f "${desktop}/Dria_Start.command" "${desktop}/Dria_Stop.command" \
+    "${desktop}/Dria_Status.command" "${desktop}/Dria_Update.command"
 
   cat > "${desktop}/Dria_Live_Log.command" <<EOF
 #!/bin/bash
 printf '\\033]0;Dria 实时日志 - 关闭窗口不停止节点\\007'
 clear
 mkdir -p "$LOG_DIR"
-touch "$OUT_LOG" "$ERR_LOG"
+touch "$OUT_LOG"
 echo "===== Dria 实时运行日志 ====="
 echo "日志会自动滚动；关闭此窗口不会停止节点。"
 echo "按 Control + C 可停止查看。"
 echo
-tail -n 60 -F "$OUT_LOG" "$ERR_LOG"
+tail -n 60 -F "$OUT_LOG"
 EOF
 
-  cat > "${desktop}/Dria_Update.command" <<EOF
-#!/bin/bash
-bash <(curl -fsSL "$RAW_SELF_URL")
-read -r -p "按回车关闭窗口……"
-EOF
-
-  chmod 700 "${desktop}/Dria_Start.command" "${desktop}/Dria_Stop.command" \
-    "${desktop}/Dria_Status.command" "${desktop}/Dria_Live_Log.command" \
-    "${desktop}/Dria_Update.command"
+  chmod 700 "${desktop}/Dria_Live_Log.command"
 }
 
 stop_service() {
@@ -369,17 +343,27 @@ show_status() {
     warn "Dria 服务当前未运行。"
   fi
   printf '\n最近日志：\n'
-  tail -n 30 "$OUT_LOG" "$ERR_LOG" 2>/dev/null || true
+  tail -n 30 "$OUT_LOG" 2>/dev/null || true
+}
+
+follow_logs() {
+  mkdir -p "$LOG_DIR"
+  touch "$OUT_LOG"
+  printf '\n===== Dria 实时日志 =====\n'
+  printf '按 Control + C 只停止查看，后台节点不会停止。\n\n'
+  tail -n 60 -F "$OUT_LOG"
 }
 
 install_all() {
-  local wallet model domain
+  local wallet model domain concurrency
   require_macos
   printf '\nDria macOS 一键安装/升级脚本 v%s\n' "$SCRIPT_VERSION"
   printf '官方项目：%s\n\n' "https://github.com/${OFFICIAL_REPO}"
 
   wallet="$(find_or_create_wallet)"
   model="$(select_model)"
+  concurrency="${DRIA_MAX_CONCURRENT:-1}"
+  [[ "$concurrency" =~ ^[1-8]$ ]] || die "DRIA_MAX_CONCURRENT 必须是 1 到 8 的整数。"
   install_official_binary
 
   domain="$(launch_domain)"
@@ -388,7 +372,7 @@ install_all() {
   pkill -TERM -x dkn-compute-node >/dev/null 2>&1 || true
   pkill -TERM -x dria-node >/dev/null 2>&1 || true
 
-  write_config "$wallet" "$model"
+  write_config "$wallet" "$model" "$concurrency"
   write_launch_agent
   write_desktop_helpers
   start_service
@@ -396,17 +380,21 @@ install_all() {
 
   printf '\n'
   info "安装/升级完成，节点会在登录后自动启动，并在退出后自动重启。"
-  info "模型：${model}｜GPU：Apple Metal 全层｜并发：1"
-  info "日志：${OUT_LOG} 和 ${ERR_LOG}"
+  info "模型：${model}｜GPU：Apple Metal 全层｜并发：${concurrency}"
+  info "日志：${OUT_LOG}"
   warn "同一台电脑可重复运行本脚本升级；钱包和模型设置会保留。"
   warn "不同电脑禁止使用同一个钱包私钥，否则任务分配和积分可能冲突。"
   show_status
+  if [ "${DRIA_NO_FOLLOW:-0}" != "1" ]; then
+    follow_logs
+  fi
 }
 
 case "${1:-install}" in
   install|update) install_all ;;
   start) require_macos; start_service ;;
   stop) require_macos; stop_service ;;
-  status|logs) require_macos; show_status ;;
+  status) require_macos; show_status ;;
+  logs) require_macos; follow_logs ;;
   *) die "用法：$0 [install|update|start|stop|status|logs]" ;;
 esac
