@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 OFFICIAL_REPO="firstbatchxyz/dkn-compute-node"
 OFFICIAL_API="https://api.github.com/repos/${OFFICIAL_REPO}/releases/latest"
 RAW_SELF_URL="https://raw.githubusercontent.com/baibai131131/deploy_nodes/refs/heads/main/deploy_dria.sh"
@@ -294,12 +294,16 @@ PLIST_EOF
 }
 
 write_desktop_helpers() {
-  local desktop="${HOME}/Desktop"
+  local desktop="${1:-${HOME}/Desktop}" update_url="$RAW_SELF_URL"
   [ -d "$desktop" ] || return 0
+
+  if [ "${DRIA_INSTALL_PROFILE:-standard}" = "m4max" ]; then
+    update_url="https://raw.githubusercontent.com/baibai131131/deploy_nodes/refs/heads/main/deploy_dria_m4max.sh"
+  fi
 
   # Keep the desktop clean: remove helpers created by older script versions.
   rm -f "${desktop}/Dria_Start.command" "${desktop}/Dria_Stop.command" \
-    "${desktop}/Dria_Status.command" "${desktop}/Dria_Update.command"
+    "${desktop}/Dria_Status.command"
 
   cat > "${desktop}/Dria_Live_Log.command" <<EOF
 #!/bin/bash
@@ -314,7 +318,24 @@ echo
 tail -n 60 -F "$OUT_LOG"
 EOF
 
-  chmod 700 "${desktop}/Dria_Live_Log.command"
+  cat > "${desktop}/Dria_Update.command" <<EOF
+#!/bin/bash
+set -Eeuo pipefail
+printf '\\033]0;Dria 更新节点\\007'
+echo "正在下载最新版脚本；保留现有钱包，更新后自动查看日志。"
+update_script="\$(mktemp -t dria-update)"
+trap 'rm -f -- "\$update_script"' EXIT
+if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 15 \\
+  "$update_url" -o "\$update_script" || [ ! -s "\$update_script" ] || ! bash -n "\$update_script"; then
+  echo "下载或脚本检查失败，尚未更新；请稍后重试。"
+  read -r -p "按回车关闭窗口……" || true
+  exit 1
+fi
+export DRIA_REQUIRE_EXISTING_WALLET=1
+bash "\$update_script"
+EOF
+
+  chmod 700 "${desktop}/Dria_Live_Log.command" "${desktop}/Dria_Update.command"
 }
 
 stop_service() {
