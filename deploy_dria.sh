@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.3.0"
 OFFICIAL_REPO="firstbatchxyz/dkn-compute-node"
 OFFICIAL_API="https://api.github.com/repos/${OFFICIAL_REPO}/releases/latest"
 RAW_SELF_URL="https://raw.githubusercontent.com/baibai131131/deploy_nodes/refs/heads/main/deploy_dria.sh"
@@ -81,30 +81,51 @@ normalize_wallet() {
 find_or_create_wallet() {
   local candidate="" file="" key=""
   local files=(
-    "$ENV_FILE"
     "${HOME}/.dria/dkn-compute-launcher/.env"
     "${HOME}/.dria/dkn-compute-node/.env"
     "${HOME}/.dria/.env"
   )
   local keys=(DRIA_WALLET DKN_WALLET_SECRET_KEY DKN_PRIVATE_KEY PRIVATE_KEY)
 
+  candidate="$(read_env_value "$ENV_FILE" DRIA_WALLET 2>/dev/null || true)"
+  if candidate="$(normalize_wallet "$candidate" 2>/dev/null)"; then
+    info "已保留本机现有 Dria 钱包。"
+    printf '%s' "$candidate"
+    return 0
+  fi
+
+  # Older NodeOS-style launchers put the wallet after --wallet in the running
+  # process. Capture it without printing it, then migrate to the protected env.
+  candidate="$(ps -axo command= 2>/dev/null | awk '
+    {
+      for (i=1; i<=NF; i++) {
+        if ($i == "--wallet") { print $(i+1); exit }
+      }
+    }
+  ')"
+  if candidate="$(normalize_wallet "$candidate" 2>/dev/null)"; then
+    info "已从正在运行的旧节点安全迁移原钱包，钱包身份保持不变。"
+    printf '%s' "$candidate"
+    return 0
+  fi
+
   for file in "${files[@]}"; do
     for key in "${keys[@]}"; do
       candidate="$(read_env_value "$file" "$key" 2>/dev/null || true)"
       if candidate="$(normalize_wallet "$candidate" 2>/dev/null)"; then
-        if [ "$file" != "$ENV_FILE" ]; then
-          mkdir -p "${APP_DIR}/backup"
-          cp -p "$file" "${APP_DIR}/backup/legacy-env-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
-          chmod 600 "${APP_DIR}/backup/"* 2>/dev/null || true
-          info "已迁移并备份本机旧版 Dria 钱包。"
-        else
-          info "已保留本机现有 Dria 钱包。"
-        fi
+        mkdir -p "${APP_DIR}/backup"
+        cp -p "$file" "${APP_DIR}/backup/legacy-env-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+        chmod 600 "${APP_DIR}/backup/"* 2>/dev/null || true
+        info "已迁移并备份本机旧版 Dria 钱包。"
         printf '%s' "$candidate"
         return 0
       fi
     done
   done
+
+  if [ "${DRIA_REQUIRE_EXISTING_WALLET:-0}" = "1" ]; then
+    die "没有读取到旧节点钱包，已停止升级；任何钱包配置都没有改变。请先启动旧节点后重试。"
+  fi
 
   candidate="$(openssl rand -hex 32)"
   normalize_wallet "$candidate" >/dev/null || die "无法生成安全钱包私钥。"
@@ -131,6 +152,15 @@ select_model() {
 
   existing="$(read_env_value "$ENV_FILE" DRIA_MODELS 2>/dev/null || true)"
   if valid_model "$existing"; then
+    # v1.2.0 used qwen3.5:0.8b as its automatic default. Move only that
+    # old default to the M4-tested text model; preserve every manually chosen
+    # model and every later explicit DRIA_MODEL override.
+    if [ "$existing" = "qwen3.5:0.8b" ]; then
+      chosen="lfm2.5:1.2b"
+      info "将旧版默认模型 ${existing} 升级为 M4 实测模型：${chosen}"
+      printf '%s' "$chosen"
+      return 0
+    fi
     info "已保留现有模型：${existing}"
     printf '%s' "$existing"
     return 0
@@ -141,14 +171,8 @@ select_model() {
     gb=$((bytes / 1024 / 1024 / 1024))
   fi
 
-  if [ "$gb" -ge 16 ]; then
-    chosen="qwen3.5:9b"
-  elif [ "$gb" -ge 8 ]; then
-    chosen="nanbeige:3b"
-  else
-    chosen="lfm2.5:1.2b"
-  fi
-  info "检测到约 ${gb}GB 内存，自动选择模型：${chosen}（官方默认 Q4 量化）。"
+  chosen="lfm2.5:1.2b"
+  info "检测到约 ${gb}GB 内存；默认选择 M4 16GB 实测稳定模型：${chosen}（Q4_K_M）。"
   printf '%s' "$chosen"
 }
 
@@ -295,6 +319,19 @@ tail -n 40 "$OUT_LOG" "$ERR_LOG" 2>/dev/null || true
 read -r -p "按回车关闭窗口……"
 EOF
 
+  cat > "${desktop}/Dria_Live_Log.command" <<EOF
+#!/bin/bash
+printf '\\033]0;Dria 实时日志 - 关闭窗口不停止节点\\007'
+clear
+mkdir -p "$LOG_DIR"
+touch "$OUT_LOG" "$ERR_LOG"
+echo "===== Dria 实时运行日志 ====="
+echo "日志会自动滚动；关闭此窗口不会停止节点。"
+echo "按 Control + C 可停止查看。"
+echo
+tail -n 60 -F "$OUT_LOG" "$ERR_LOG"
+EOF
+
   cat > "${desktop}/Dria_Update.command" <<EOF
 #!/bin/bash
 bash <(curl -fsSL "$RAW_SELF_URL")
@@ -302,7 +339,8 @@ read -r -p "按回车关闭窗口……"
 EOF
 
   chmod 700 "${desktop}/Dria_Start.command" "${desktop}/Dria_Stop.command" \
-    "${desktop}/Dria_Status.command" "${desktop}/Dria_Update.command"
+    "${desktop}/Dria_Status.command" "${desktop}/Dria_Live_Log.command" \
+    "${desktop}/Dria_Update.command"
 }
 
 stop_service() {
