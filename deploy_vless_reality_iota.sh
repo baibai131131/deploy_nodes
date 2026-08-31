@@ -4,7 +4,8 @@ set -Eeuo pipefail
 # VLESS + REALITY + TCP + XTLS-Vision installer for a dedicated VPS.
 # Safety rule: this script refuses to install on a VPS that already runs Hysteria/HY2.
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
+readonly XRAY_VERSION="v26.3.27"
 readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly STATE_DIR="/etc/vless-reality-iota"
 readonly INFO_FILE="/root/VLESS_REALITY_INFO.txt"
@@ -92,20 +93,50 @@ install_xray() {
   installer="$temp_dir/install-release.sh"
   trap 'rm -rf -- "$temp_dir"' RETURN
   curl -fL --retry 3 --connect-timeout 10 "$INSTALLER_URL" -o "$installer"
-  bash "$installer" install
+  # Pin the last Xray release covered by Mihomo's documented REALITY
+  # compatibility window. Do not silently track breaking core releases.
+  bash "$installer" install --version "$XRAY_VERSION"
   [[ -x /usr/local/bin/xray ]] || die "Xray官方安装程序执行后未找到主程序。"
+  /usr/local/bin/xray version | head -1 | grep -q "${XRAY_VERSION#v}" || \
+    die "Xray版本不符合预期；需要 ${XRAY_VERSION}。"
   trap - RETURN
   rm -rf -- "$temp_dir"
 }
 
+is_public_ipv4() {
+  python3 - "$1" <<'PY'
+import ipaddress, sys
+try:
+    ip = ipaddress.ip_address(sys.argv[1])
+    raise SystemExit(0 if ip.version == 4 and ip.is_global else 1)
+except ValueError:
+    raise SystemExit(1)
+PY
+}
+
 get_public_ip() {
-  local ip=''
-  ip=$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
-  if [[ ! $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+  local configured=${VLESS_HOST:-} interface_ip='' external_ip=''
+
+  if [[ -n $configured ]]; then
+    is_public_ipv4 "$configured" || die "VLESS_HOST 必须是公网IPv4地址。"
+    printf '%s' "$configured"
+    return
   fi
-  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "无法自动获取VPS公网IPv4。"
-  printf '%s' "$ip"
+
+  interface_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+  external_ip=$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
+
+  if is_public_ipv4 "$interface_ip"; then
+    if is_public_ipv4 "$external_ip" && [[ $interface_ip != "$external_ip" ]]; then
+      warn "网卡公网IP(${interface_ip})与出口IP(${external_ip})不同，将使用可入站的网卡IP。"
+    fi
+    printf '%s' "$interface_ip"
+  elif is_public_ipv4 "$external_ip"; then
+    warn "VPS可能位于NAT后，使用出口IP ${external_ip}；请确认服务商已映射TCP端口。"
+    printf '%s' "$external_ip"
+  else
+    die "无法确定VPS公网IPv4。可用 VLESS_HOST=公网IP 重新运行。"
+  fi
 }
 
 generate_keys() {
@@ -236,6 +267,7 @@ proxies:
     tls: true
     udp: true
     flow: xtls-rprx-vision
+    packet-encoding: xudp
     servername: ${sni}
     client-fingerprint: chrome
     reality-opts:
@@ -274,6 +306,86 @@ INFO
   chmod 600 "$STATE_DIR/info.txt"
 }
 
+self_test_reality() {
+  local port=$1 uuid=$2 public_key=$3 short_id=$4 sni=$5
+  local test_dir socks_port client_pid result=''
+  test_dir=$(mktemp -d)
+  for _ in {1..20}; do
+    socks_port=$((20000 + RANDOM % 20000))
+    ss -lntH "sport = :${socks_port}" 2>/dev/null | grep -q . || break
+  done
+  ss -lntH "sport = :${socks_port}" 2>/dev/null | grep -q . && \
+    die "无法为REALITY自检找到本地临时端口。"
+
+  cat >"$test_dir/client.json" <<JSON
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": ${socks_port},
+      "protocol": "socks",
+      "settings": {"udp": false}
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": ${port},
+            "users": [
+              {
+                "id": "${uuid}",
+                "encryption": "none",
+                "flow": "xtls-rprx-vision"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "${sni}",
+          "fingerprint": "chrome",
+          "password": "${public_key}",
+          "shortId": "${short_id}",
+          "spiderX": "/"
+        }
+      }
+    }
+  ]
+}
+JSON
+
+  /usr/local/bin/xray run -test -config "$test_dir/client.json" >/dev/null
+  /usr/local/bin/xray run -config "$test_dir/client.json" >"$test_dir/client.log" 2>&1 &
+  client_pid=$!
+
+  for _ in {1..30}; do
+    ss -lntH "sport = :${socks_port}" 2>/dev/null | grep -q . && break
+    kill -0 "$client_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+
+  result=$(curl -4fsS --socks5-hostname "127.0.0.1:${socks_port}" \
+    --connect-timeout 8 --max-time 20 https://api.ipify.org 2>/dev/null || true)
+  kill "$client_pid" 2>/dev/null || true
+  wait "$client_pid" 2>/dev/null || true
+  if ! is_public_ipv4 "$result"; then
+    cat "$test_dir/client.log" >&2
+    rm -rf -- "$test_dir"
+    die "REALITY本机客户端握手自检失败；脚本不会输出不可用订阅。"
+  fi
+
+  log "REALITY客户端握手自检通过，代理出口：${result}"
+  rm -rf -- "$test_dir"
+}
+
 recover_client_files() {
   local ip port uuid private_key public_key short_id sni key_output
   local -a values
@@ -301,6 +413,7 @@ PY
   public_key=$(awk -F': *' '/Public[Kk]ey|Public key|Password/ {print $2; exit}' <<<"$key_output")
   [[ -n $public_key ]] || die "无法从现有REALITY私钥恢复公钥。"
   ip=$(get_public_ip)
+  self_test_reality "$port" "$uuid" "$public_key" "$short_id" "$sni"
   write_client_files "$ip" "$port" "$uuid" "$public_key" "$short_id" "$sni"
 }
 
@@ -405,11 +518,8 @@ main() {
 
   if (( RESUME_INSTALL )); then
     log "检测到本脚本管理的现有节点，继续完成修复和订阅配置。"
-    command -v python3 >/dev/null 2>&1 || {
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y
-      apt-get install -y --no-install-recommends python3 curl openssl
-    }
+    install_dependencies
+    install_xray
     chown root:nogroup "$(dirname "$XRAY_CONFIG")" "$XRAY_CONFIG"
     chmod 750 "$(dirname "$XRAY_CONFIG")"
     chmod 640 "$XRAY_CONFIG"
@@ -461,6 +571,7 @@ main() {
     die "Xray启动失败，请保留上方日志。"
   }
 
+  self_test_reality "$port" "$uuid" "$public_key" "$short_id" "$sni"
   write_client_files "$ip" "$port" "$uuid" "$public_key" "$short_id" "$sni"
   subscription_url=$(install_subscription_service)
 
