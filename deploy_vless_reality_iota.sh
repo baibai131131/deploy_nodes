@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # VLESS + REALITY + TCP + XTLS-Vision installer for a dedicated VPS.
 # Safety rule: this script refuses to install on a VPS that already runs Hysteria/HY2.
 
-readonly SCRIPT_VERSION="1.2.1"
+readonly SCRIPT_VERSION="1.2.2"
 readonly XRAY_VERSION="v26.3.27"
 readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly STATE_DIR="/etc/vless-reality-iota"
@@ -335,7 +335,7 @@ self_test_reality() {
 
   cat >"$test_dir/client.json" <<JSON
 {
-  "log": {"loglevel": "warning"},
+  "log": {"loglevel": "debug"},
   "inbounds": [
     {
       "listen": "127.0.0.1",
@@ -368,7 +368,7 @@ self_test_reality() {
         "realitySettings": {
           "serverName": "${sni}",
           "fingerprint": "chrome",
-          "password": "${public_key}",
+          "publicKey": "${public_key}",
           "shortId": "${short_id}",
           "spiderX": "/"
         }
@@ -393,7 +393,10 @@ JSON
   kill "$client_pid" 2>/dev/null || true
   wait "$client_pid" 2>/dev/null || true
   if ! is_public_ipv4 "$result"; then
+    warn "===== REALITY客户端自检日志 ====="
     cat "$test_dir/client.log" >&2
+    warn "===== Xray服务最近日志 ====="
+    journalctl -u xray -n 50 --no-pager >&2 || true
     rm -rf -- "$test_dir"
     die "REALITY本机客户端握手自检失败；脚本不会输出不可用订阅。"
   fi
