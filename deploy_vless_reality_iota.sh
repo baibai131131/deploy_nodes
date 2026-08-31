@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # VLESS + REALITY + TCP + XTLS-Vision installer for a dedicated VPS.
 # Safety rule: this script refuses to install on a VPS that already runs Hysteria/HY2.
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.2.1"
 readonly XRAY_VERSION="v26.3.27"
 readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly STATE_DIR="/etc/vless-reality-iota"
@@ -63,6 +63,21 @@ check_existing_xray() {
       RESUME_INSTALL=1
       return
     fi
+    # The official installer creates an empty/default config before this script
+    # writes its managed config. Permit recovery only when there are no inbounds.
+    if [[ -f "$XRAY_CONFIG" && ! -d "$STATE_DIR" ]] && python3 - "$XRAY_CONFIG" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        config = json.load(f)
+except (OSError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if not config.get("inbounds") else 1)
+PY
+    then
+      warn "检测到上次中断留下的Xray空配置，将安全继续安装。"
+      return
+    fi
     die "检测到其他 Xray/VLESS 配置。为避免覆盖现有节点，本脚本已停止。"
   fi
 }
@@ -88,7 +103,7 @@ install_dependencies() {
 }
 
 install_xray() {
-  local temp_dir installer
+  local temp_dir installer installed_version
   temp_dir=$(mktemp -d)
   installer="$temp_dir/install-release.sh"
   trap 'rm -rf -- "$temp_dir"' RETURN
@@ -97,8 +112,9 @@ install_xray() {
   # compatibility window. Do not silently track breaking core releases.
   bash "$installer" install --version "$XRAY_VERSION"
   [[ -x /usr/local/bin/xray ]] || die "Xray官方安装程序执行后未找到主程序。"
-  /usr/local/bin/xray version | head -1 | grep -q "${XRAY_VERSION#v}" || \
-    die "Xray版本不符合预期；需要 ${XRAY_VERSION}。"
+  installed_version=$(/usr/local/bin/xray version 2>&1 | awk 'NR == 1 {print $2}')
+  [[ $installed_version == "${XRAY_VERSION#v}" ]] || \
+    die "Xray版本不符合预期；检测到 ${installed_version:-unknown}，需要 ${XRAY_VERSION#v}。"
   trap - RETURN
   rm -rf -- "$temp_dir"
 }
@@ -418,7 +434,7 @@ PY
 }
 
 install_subscription_service() {
-  local ip token subscription_url
+  local ip token subscription_url local_subscription
   ip=$(get_public_ip)
   install -d -o root -g nogroup -m 750 "$STATE_DIR" "$SUB_DIR"
 
@@ -500,7 +516,8 @@ EOF
     journalctl -u vless-reality-subscription.service -n 50 --no-pager >&2
     die "Clash订阅服务启动失败。"
   }
-  curl -fsS --max-time 5 "http://127.0.0.1:${SUB_PORT}/${token}" | grep -q 'IOTA-VLESS-REALITY' || die "Clash订阅本机验证失败。"
+  local_subscription=$(curl -fsS --max-time 5 "http://127.0.0.1:${SUB_PORT}/${token}")
+  grep -q 'IOTA-VLESS-REALITY' <<<"$local_subscription" || die "Clash订阅本机验证失败。"
 
   subscription_url="http://${ip}:${SUB_PORT}/${token}"
   printf '\nClash/Mihomo订阅网址：\n%s\n' "$subscription_url" >>"$INFO_FILE"
@@ -576,7 +593,7 @@ main() {
   subscription_url=$(install_subscription_service)
 
   printf '\n===== 安装成功 =====\n'
-  /usr/local/bin/xray version | head -1
+  /usr/local/bin/xray version 2>&1 | sed -n '1p'
   printf '协议：VLESS + REALITY + TCP + XTLS-Vision\n'
   printf '端口：%s/TCP\n' "$port"
   printf 'Clash配置：%s\n' "$CLASH_FILE"
