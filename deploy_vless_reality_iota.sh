@@ -4,12 +4,18 @@ set -Eeuo pipefail
 # VLESS + REALITY + TCP + XTLS-Vision installer for a dedicated VPS.
 # Safety rule: this script refuses to install on a VPS that already runs Hysteria/HY2.
 
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.1.0"
 readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly STATE_DIR="/etc/vless-reality-iota"
 readonly INFO_FILE="/root/VLESS_REALITY_INFO.txt"
 readonly CLASH_FILE="/root/VLESS_REALITY_CLASH.yaml"
+readonly SUB_DIR="/var/lib/vless-reality-subscription"
+readonly SUB_PORT="18080"
+readonly SUB_SERVER="/usr/local/sbin/vless_reality_subscription.py"
+readonly SUB_SERVICE="/etc/systemd/system/vless-reality-subscription.service"
 readonly INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+
+RESUME_INSTALL=0
 
 log() { printf '[信息] %s\n' "$*"; }
 warn() { printf '[警告] %s\n' "$*" >&2; }
@@ -50,9 +56,13 @@ refuse_hy2_vps() {
   fi
 }
 
-refuse_existing_xray() {
+check_existing_xray() {
   if [[ -e "$XRAY_CONFIG" || -d "$STATE_DIR" ]]; then
-    die "检测到已有 Xray/VLESS 配置。为避免覆盖现有节点，本脚本已停止。"
+    if [[ -f "$XRAY_CONFIG" && -d "$STATE_DIR" ]] && grep -q 'vless-reality-iota' "$XRAY_CONFIG"; then
+      RESUME_INSTALL=1
+      return
+    fi
+    die "检测到其他 Xray/VLESS 配置。为避免覆盖现有节点，本脚本已停止。"
   fi
 }
 
@@ -73,7 +83,7 @@ install_dependencies() {
   log "安装基础依赖……"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y --no-install-recommends ca-certificates curl openssl iproute2
+  apt-get install -y --no-install-recommends ca-certificates curl openssl iproute2 python3
 }
 
 install_xray() {
@@ -264,11 +274,158 @@ INFO
   chmod 600 "$STATE_DIR/info.txt"
 }
 
+recover_client_files() {
+  local ip port uuid private_key public_key short_id sni key_output
+  local -a values
+  mapfile -t values < <(python3 - "$XRAY_CONFIG" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    c = json.load(f)
+i = next(x for x in c["inbounds"] if x.get("tag") == "vless-reality-iota")
+r = i["streamSettings"]["realitySettings"]
+u = i["settings"]["clients"][0]
+print(i["port"])
+print(u["id"])
+print(r["privateKey"])
+print(r["shortIds"][0])
+print(r["serverNames"][0])
+PY
+)
+  [[ ${#values[@]} -eq 5 ]] || die "无法读取现有VLESS配置。"
+  port=${values[0]}
+  uuid=${values[1]}
+  private_key=${values[2]}
+  short_id=${values[3]}
+  sni=${values[4]}
+  key_output=$(/usr/local/bin/xray x25519 -i "$private_key")
+  public_key=$(awk -F': *' '/Public[Kk]ey|Public key|Password/ {print $2; exit}' <<<"$key_output")
+  [[ -n $public_key ]] || die "无法从现有REALITY私钥恢复公钥。"
+  ip=$(get_public_ip)
+  write_client_files "$ip" "$port" "$uuid" "$public_key" "$short_id" "$sni"
+}
+
+install_subscription_service() {
+  local ip token subscription_url
+  ip=$(get_public_ip)
+  install -d -o root -g nogroup -m 750 "$STATE_DIR" "$SUB_DIR"
+
+  if [[ -s "$STATE_DIR/subscription_token" ]]; then
+    token=$(<"$STATE_DIR/subscription_token")
+  else
+    token=$(openssl rand -hex 24)
+    printf '%s\n' "$token" >"$STATE_DIR/subscription_token"
+  fi
+  chown root:nogroup "$STATE_DIR/subscription_token"
+  chmod 640 "$STATE_DIR/subscription_token"
+
+  install -o root -g nogroup -m 640 "$CLASH_FILE" "$SUB_DIR/config.yaml"
+
+  cat >"$SUB_SERVER" <<'PY'
+#!/usr/bin/env python3
+import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+p = argparse.ArgumentParser()
+p.add_argument("--port", type=int, required=True)
+p.add_argument("--token-file", required=True)
+p.add_argument("--config", required=True)
+a = p.parse_args()
+token = Path(a.token_file).read_text(encoding="utf-8").strip()
+config = Path(a.config)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?", 1)[0] != "/" + token:
+            self.send_error(404)
+            return
+        body = config.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/yaml; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, fmt, *args):
+        return
+
+ThreadingHTTPServer(("0.0.0.0", a.port), Handler).serve_forever()
+PY
+  chmod 755 "$SUB_SERVER"
+
+  cat >"$SUB_SERVICE" <<EOF
+[Unit]
+Description=VLESS Reality Clash Subscription
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/usr/bin/python3 ${SUB_SERVER} --port ${SUB_PORT} --token-file ${STATE_DIR}/subscription_token --config ${SUB_DIR}/config.yaml
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${SUB_PORT}/tcp" >/dev/null
+  fi
+
+  systemctl daemon-reload
+  systemctl enable --now vless-reality-subscription.service >/dev/null
+  systemctl restart vless-reality-subscription.service
+  sleep 1
+  systemctl is-active --quiet vless-reality-subscription.service || {
+    journalctl -u vless-reality-subscription.service -n 50 --no-pager >&2
+    die "Clash订阅服务启动失败。"
+  }
+  curl -fsS --max-time 5 "http://127.0.0.1:${SUB_PORT}/${token}" | grep -q 'IOTA-VLESS-REALITY' || die "Clash订阅本机验证失败。"
+
+  subscription_url="http://${ip}:${SUB_PORT}/${token}"
+  printf '\nClash/Mihomo订阅网址：\n%s\n' "$subscription_url" >>"$INFO_FILE"
+  cp "$INFO_FILE" "$STATE_DIR/info.txt"
+  chown root:nogroup "$STATE_DIR/info.txt"
+  chmod 640 "$STATE_DIR/info.txt"
+  printf '%s' "$subscription_url"
+}
+
 main() {
   require_root
   check_system
   refuse_hy2_vps
-  refuse_existing_xray
+  check_existing_xray
+
+  if (( RESUME_INSTALL )); then
+    log "检测到本脚本管理的现有节点，继续完成修复和订阅配置。"
+    command -v python3 >/dev/null 2>&1 || {
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y --no-install-recommends python3 curl openssl
+    }
+    chown root:nogroup "$(dirname "$XRAY_CONFIG")" "$XRAY_CONFIG"
+    chmod 750 "$(dirname "$XRAY_CONFIG")"
+    chmod 640 "$XRAY_CONFIG"
+    /usr/local/bin/xray run -test -config "$XRAY_CONFIG"
+    systemctl restart xray
+    sleep 1
+    systemctl is-active --quiet xray || die "现有Xray服务启动失败。"
+    recover_client_files
+    subscription_url=$(install_subscription_service)
+    printf '\n===== 配置完成 =====\n'
+    printf 'Xray状态：active\n'
+    printf 'VLESS端口：443/TCP\n'
+    printf '订阅网址：%s\n' "$subscription_url"
+    printf '订阅网址已同时保存到：%s\n' "$INFO_FILE"
+    exit 0
+  fi
 
   local port target sni ip uuid short_id private_key public_key
   local -a keys
@@ -305,6 +462,7 @@ main() {
   }
 
   write_client_files "$ip" "$port" "$uuid" "$public_key" "$short_id" "$sni"
+  subscription_url=$(install_subscription_service)
 
   printf '\n===== 安装成功 =====\n'
   /usr/local/bin/xray version | head -1
@@ -312,6 +470,7 @@ main() {
   printf '端口：%s/TCP\n' "$port"
   printf 'Clash配置：%s\n' "$CLASH_FILE"
   printf '节点信息：%s\n\n' "$INFO_FILE"
+  printf 'Clash/Mihomo订阅：%s\n' "$subscription_url"
   cat "$INFO_FILE"
   printf '\n重要：请妥善保管以上链接和配置，里面含有节点凭证。\n'
 }
