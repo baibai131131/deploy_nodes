@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # VLESS + REALITY + TCP + XTLS-Vision installer for a dedicated VPS.
 # Safety rule: this script refuses to install on a VPS that already runs Hysteria/HY2.
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly STATE_DIR="/etc/vless-reality-iota"
 readonly INFO_FILE="/root/VLESS_REALITY_INFO.txt"
@@ -177,7 +177,10 @@ write_config() {
   }
 }
 JSON
-  chmod 600 "$XRAY_CONFIG"
+  # The official Xray systemd unit runs as nobody:nogroup on Ubuntu/Debian.
+  # Keep the REALITY private key non-public while allowing that service to read it.
+  chown root:nogroup "$XRAY_CONFIG"
+  chmod 640 "$XRAY_CONFIG"
 }
 
 enable_bbr() {
