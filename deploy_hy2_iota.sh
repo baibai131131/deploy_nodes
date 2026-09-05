@@ -103,7 +103,7 @@ crontab "$CRON_TMP"
 rm -f "$CRON_TMP"
 
 echo "===== 安装 HY2：禁用每日重启 ====="
-SCRIPT_MODE=1 ENABLE_AUTO_REBOOT_CACHE=0 bash "$TMP_SCRIPT"
+SCRIPT_MODE=1 ENABLE_AUTO_REBOOT_CACHE=0 HY2_PORT_COUNT=1 bash "$TMP_SCRIPT"
 
 HY2_ACTUAL_SHA256="$(sha256sum /usr/local/bin/hysteria | awk '{print $1}')"
 if [ "$HY2_ACTUAL_SHA256" != "$HY2_EXPECTED_SHA256" ]; then
