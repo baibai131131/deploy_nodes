@@ -3,13 +3,13 @@ set -euo pipefail
 setopt null_glob
 umask 077
 
-# IOTA Guardian V6.1：精准状态判断，并提供官方 Run 池实时查询。
+# IOTA Guardian V6.2：精准状态判断、注册阶段诊断，并提供官方 Run 池实时查询。
 [[ "$(uname -s)" == Darwin ]] || { echo "本脚本仅支持 macOS。"; exit 1; }
 [[ "$(id -u)" != 0 ]] || { echo "请使用当前登录用户运行，不要使用 sudo。"; exit 1; }
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.1.0"
+VERSION="6.2.0"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
@@ -25,7 +25,7 @@ done
 trap 'echo "安装未完成。备份：$BACKUP；请保留此目录，勿上传（含 Push URL）。" >&2' ZERR
 
 echo "=============================================="
-echo " IOTA Guardian V6.1 精准状态版"
+echo " IOTA Guardian V6.2 精准状态版"
 echo "=============================================="
 echo "只监控、记录、告警和清理旧日志，不控制或重启 IOTA。"
 echo
@@ -72,7 +72,7 @@ try:
         raw = fh.read()
     lines = raw.decode("utf-8", errors="replace").splitlines()[-20000:]
 except Exception:
-    print("UNKNOWN\t\t\t\t\t\t999999\t无法读取日志\t0\t0")
+    print("UNKNOWN\t-\t-\t-\t-\t-\t999999\t无法读取日志\t0\t0\t-\t999999\t999999")
     raise SystemExit
 
 ts_re = re.compile(r"(?:\[)?(20\d\d-\d\d-\d\d[ T]\d\d:\d\d:\d\d)(?:\.\d+)?")
@@ -94,6 +94,9 @@ last_activity_i = -1
 last_activity_ts = None
 last_activity_name = ""
 send_fail = send_ok = 0
+reg_error = ""
+reg_error_ts = None
+queue_warn_ts = None
 
 def set_state(value, i, ts, hard=False):
     global state, state_i, state_ts, barrier_i
@@ -116,6 +119,17 @@ for i, line in enumerate(lines):
     m = re.search(r"Broadcast peer status:\s*([0-9]+/[0-9]+)\s+ok", line, re.I)
     if m: p2p = m.group(1)
 
+    # Keep recent registration failures visible after the client automatically rejoins the queue.
+    if "invalid_attestation_challenge" in low:
+        reg_error = "invalid_attestation_challenge"
+        if ts is not None: reg_error_ts = ts
+    elif "error registering miner" in low:
+        reg_error = "registration_error"
+        if ts is not None: reg_error_ts = ts
+    if (("register.queue_state" in low and ("503" in low or "no handler" in low)) or
+            "register_set_queue_state exhausted retries" in low):
+        queue_warn_ts = ts
+
     # Newer state-changing events always override older activity.
     if ("signal=sigabrt" in low or "training exited with code=1" in low or
             "training process exited with code 1" in low or "miner process exited" in low):
@@ -123,10 +137,21 @@ for i, line in enumerate(lines):
     if ("closing iota cli" in low or "cleaning up miner on shutdown" in low or
             "p2p shutdown complete" in low):
         set_state("STOPPED", i, ts, True); continue
+    if "invalid_attestation_challenge" in low or "error registering miner" in low:
+        set_state("REG_FAILED", i, ts, True); continue
     if ("resetting miner entire state" in low or "entitynotregistered" in low or
             "appears to have been kicked" in low or "miner.kicked" in low or
             "miner not registered error" in low):
         set_state("RESETTING", i, ts, True); continue
+    if re.search(r"status['\"]?\s*:\s*['\"]failed", low):
+        pos = ""
+        set_state("REG_FAILED", i, ts, True); continue
+    if re.search(r"status['\"]?\s*:\s*['\"]processing", low):
+        pos = ""
+        set_state("PROCESSING", i, ts, True); continue
+    if re.search(r"status['\"]?\s*:\s*['\"]confirmed", low):
+        pos = ""
+        set_state("CONFIRMED", i, ts, True); continue
     if ("attempting to join registration waitlist" in low or
             re.search(r"status['\"]?\s*:\s*['\"]queued", low)):
         set_state("QUEUED", i, ts, True); continue
@@ -150,17 +175,19 @@ for i, line in enumerate(lines):
 
     # Only completed computation/data movement is counted as real training.
     strong = None
-    if re.search(r"End (forward|backward)", line, re.I): strong = "计算完成"
+    if re.search(r"(?:End (?:forward|backward)|(?:FORWARD|BACKWARD) complete)", line, re.I): strong = "计算完成"
     elif re.search(r"End (upload|submit) activation", line, re.I): strong = "activation完成"
+    elif "activation push send" in low and "ack ok" in low: strong = "activation送达"
     elif "activation push recv" in low and ("materialize done" in low or "pulled ingress" in low): strong = "收到activation"
     elif "/miner/submit_activation; response:" in low and "error" not in low: strong = "提交activation"
+    elif "weights submitted successfully" in low: strong = "权重提交成功"
     elif "submit_weights:" in low or "getting pseudo gradients" in low or "optimization_reset:" in low: strong = "权重训练"
     if strong:
         last_activity_i, last_activity_ts, last_activity_name = i, ts, strong
         set_state("TRAINING", i, ts)
 
     if "failed to send" in low and "activation" in low: send_fail += 1
-    if ("activation push send" in low and "success" in low) or "end upload activation" in low: send_ok += 1
+    if ("activation push send" in low and ("success" in low or "ack ok" in low)) or "end upload activation" in low: send_ok += 1
 
 activity_age = 999999 if last_activity_ts is None else max(0, now - last_activity_ts)
 # 最近5分钟的有效计算优先于普通 idle heartbeat，但不能越过排队/重置/合并等新状态。
@@ -171,7 +198,10 @@ elif state == "TRAINING" and activity_age > 300:
     state = "RUN_IDLE"
 
 detail = last_activity_name or "无近期有效训练事件"
-values = [state, pos, run, layer, epoch, p2p, str(activity_age), detail, str(send_fail), str(send_ok)]
+reg_error_age = 999999 if reg_error_ts is None else max(0, now - reg_error_ts)
+queue_warn_age = 999999 if queue_warn_ts is None else max(0, now - queue_warn_ts)
+values = [state, pos or "-", run or "-", layer or "-", epoch or "-", p2p or "-", str(activity_age), detail,
+          str(send_fail), str(send_ok), reg_error or "-", str(reg_error_age), str(queue_warn_age)]
 print("\t".join(v.replace("\t", " ").replace("\n", " ") for v in values))
 PY
 
@@ -188,7 +218,7 @@ URLS = (
 RUN_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(?:-[A-Za-z0-9_-]+)?$")
 
 def fetch(url):
-    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.1", "Accept": "application/json"})
+    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.2", "Accept": "application/json"})
     with urlopen(req, timeout=12) as res:
         return json.load(res)
 
@@ -312,8 +342,11 @@ APP=0; CLI=0
 (( AGE<=180 )) || finish STALE down "🔴 日志卡住 | STALE | ${AGE}秒未更新 | 程序可能失联 | 磁盘${D}%" "$AGE"
 
 RESULT=$(/usr/bin/python3 "$BASE/status_engine.py" "$LATEST" 2>/dev/null)
-IFS=$'\t' read -r STATE POS RUNID LAYER EPOCH P2P ACTIVEAGE DETAIL FAILS OKS <<< "$RESULT"
+IFS=$'\t' read -r STATE POS RUNID LAYER EPOCH P2P ACTIVEAGE DETAIL FAILS OKS REGERROR REGERRORAGE QUEUEWARNAGE <<< "$RESULT"
 [[ -n "${STATE:-}" ]] || STATE=UNKNOWN
+for FIELD in POS RUNID LAYER EPOCH P2P REGERROR; do
+  [[ "${(P)FIELD:-}" == "-" ]] && typeset -g "$FIELD="
+done
 CPU=$(/bin/ps -A -o %cpu=,command= | awk '/main_pool/ && !/awk/{s+=$1} END{printf "%.0f",s+0}')
 RUNINFO=""; [[ -n "$RUNID" ]] && RUNINFO="Run ${RUNID}"; [[ -n "$LAYER" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }L${LAYER}"; [[ -n "$EPOCH" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }E${EPOCH}"; [[ -n "$RUNINFO" ]] || RUNINFO="Run待更新"
 OLD=$(cat "$LAST" 2>/dev/null || echo '')
@@ -322,14 +355,24 @@ if [[ "$STATE" == QUEUED ]]; then
 else rm -f "$QUEUE_START"; fi
 QTXT=""; [[ "$STATE" == QUEUED && -s "$QUEUE_START" ]] && QTXT=$(duration $((NOW-$(cat "$QUEUE_START"))))
 ATXT="无近期有效计算"; [[ "$ACTIVEAGE" != 999999 ]] && ATXT="上次有效计算$(duration "$ACTIVEAGE")前"
+WARN=""
+[[ -n "${REGERROR:-}" && "${REGERRORAGE:-999999}" -le 21600 ]] && WARN=" | 上轮确认失败 ${REGERROR}"
+[[ "${QUEUEWARNAGE:-999999}" -le 600 ]] && WARN="${WARN} | 调度接口503"
+NETWARN=""
+if [[ "$P2P" =~ '^([0-9]+)/([0-9]+)$' ]] && (( match[2] > 0 && match[1] * 100 < match[2] * 25 )); then
+  NETWARN=" | P2P偏低 ${P2P}"
+fi
 
 case "$STATE" in
- TRAINING) STATUS=up; MSG="🟢 真实训练 | TRAINING | ${RUNINFO} | ${DETAIL} | ${ATXT} | CPU ${CPU}% | P2P ${P2P:-待更新} | 日志${AGE}秒" ;;
+ TRAINING) STATUS=up; MSG="🟢 真实训练 | TRAINING | ${RUNINFO} | ${DETAIL} | ${ATXT} | CPU ${CPU}% | P2P ${P2P:-待更新}${NETWARN} | 日志${AGE}秒" ;;
  MERGING) STATUS=up; MSG="🟡 合并阶段 | MERGING | ${RUNINFO} | 当前没有训练计算属正常 | ${ATXT} | 日志${AGE}秒" ;;
- SYNCING) STATUS=up; MSG="🟡 权重同步 | SYNCING | ${RUNINFO} | 正在下载/设置模型权重 | CPU ${CPU}% | 日志${AGE}秒" ;;
- RUN_IDLE) STATUS=up; MSG="🟠 池内等待 | RUN_IDLE | ${RUNINFO} | 已在Run但近期无有效计算 | ${ATXT} | CPU ${CPU}% | 日志${AGE}秒" ;;
+ SYNCING) STATUS=up; MSG="🟡 权重同步 | SYNCING | ${RUNINFO} | 正在上传/下载/设置模型权重${NETWARN} | CPU ${CPU}% | 日志${AGE}秒" ;;
+ RUN_IDLE) STATUS=up; MSG="🟠 池内等待 | RUN_IDLE | ${RUNINFO} | 已在Run但近期无有效计算 | ${ATXT}${NETWARN} | CPU ${CPU}% | 日志${AGE}秒" ;;
  INITIALIZING) STATUS=up; MSG="🟠 训练池初始化 | INITIALIZING | ${RUNINFO} | 尚未出现有效计算 | 日志${AGE}秒" ;;
- QUEUED) STATUS=up; MSG="🔵 正常排队 | QUEUED${POS:+ | 位置${POS}} | 已排${QTXT:-0分钟} | 尚未训练 | 日志${AGE}秒" ;;
+ CONFIRMED) STATUS=up; MSG="🔵 已到队首确认 | CONFIRMED | 服务端已确认，尚未分配Run | 日志${AGE}秒" ;;
+ PROCESSING) STATUS=up; MSG="🟠 注册处理中 | PROCESSING | 正在验证设备并分配Run | 日志${AGE}秒" ;;
+ REG_FAILED) STATUS=down; MSG="🔴 注册确认失败 | REG_FAILED${REGERROR:+ | ${REGERROR}} | 客户端通常会自动重新排队 | 日志${AGE}秒" ;;
+ QUEUED) STATUS=up; MSG="🔵 正常排队 | QUEUED${POS:+ | 位置${POS}} | 已排${QTXT:-0分钟} | 尚未训练${WARN} | 日志${AGE}秒" ;;
  RESETTING) STATUS=down; MSG="🔴 注册被重置 | RESETTING | 已失去Run注册，等待重新排队 | 日志${AGE}秒" ;;
  CRASHED) STATUS=down; MSG="🔴 程序崩溃 | CRASHED | miner异常退出 | 日志${AGE}秒" ;;
  STOPPED) STATUS=down; MSG="🔴 IOTA停止 | STOPPED | 请点击 Start training | 日志${AGE}秒" ;;
@@ -356,7 +399,7 @@ cat > "$STAGE/daily_report.sh" <<'REPORT'
 BASE="$HOME/.iota-guardian"; TODAY=$(date '+%Y-%m-%d'); S="$BASE/samples-$TODAY.csv"; R="$BASE/reports/$TODAY.txt"; mkdir -p "$BASE/reports"
 count(){ grep -c ",\"$1\"," "$S" 2>/dev/null || true; }
 cat > "$R" <<EOF2
-IOTA Guardian V6.1 每日报告
+IOTA Guardian V6.2 每日报告
 日期：$TODAY
 电脑：$(cat "$BASE/node_name" 2>/dev/null)
 真实训练：约 $(count TRAINING) 分钟
@@ -364,6 +407,7 @@ IOTA Guardian V6.1 每日报告
 权重同步：约 $(count SYNCING) 分钟
 池内等待：约 $(count RUN_IDLE) 分钟
 排队：约 $(count QUEUED) 分钟
+注册阶段：CONFIRMED $(count CONFIRMED) / PROCESSING $(count PROCESSING) / REG_FAILED $(count REG_FAILED) 分钟
 故障：RESETTING $(count RESETTING) / CRASHED $(count CRASHED) / STOPPED $(count STOPPED) / STALE $(count STALE) 分钟
 当前：$(cat "$BASE/current_message" 2>/dev/null)
 EOF2
@@ -373,7 +417,7 @@ REPORT
 cat > "$STAGE/show_report.sh" <<'SHOW'
 #!/bin/zsh
 BASE="$HOME/.iota-guardian"
-echo "===== IOTA Guardian V6.1 精准状态版 ====="
+echo "===== IOTA Guardian V6.2 精准状态版 ====="
 echo "版本：$(cat "$BASE/version" 2>/dev/null)"
 echo "电脑：$(cat "$BASE/node_name" 2>/dev/null)"
 echo "当前：$(cat "$BASE/current_message" 2>/dev/null)"
@@ -413,10 +457,10 @@ for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL"; do /usr/bin/instal
 mv "$STAGE" "$BACKUP/staged-install"; trap - ZERR
 
 echo
-echo "✅ IOTA Guardian V6.1 安装/升级完成"
+echo "✅ IOTA Guardian V6.2 安装/升级完成"
 echo "电脑：$(cat "$BASE/node_name")"
 echo "60秒检测一次；日志超过180秒才判定 STALE。"
-echo "TRAINING=真实计算；MERGING=合并；SYNCING=权重同步；RUN_IDLE=池内等待；QUEUED=排队。"
+echo "TRAINING=真实计算；MERGING=合并；SYNCING=权重同步；CONFIRMED/PROCESSING=注册中；QUEUED=排队。"
 echo "查看全部 Run 池：$BASE/show_runs.sh"
 echo "本工具不会启动、停止、重启或点击 IOTA，也不会修改钱包和 miner。"
 echo "请等待约60秒后查看 Uptime Kuma。"
