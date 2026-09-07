@@ -9,7 +9,7 @@ umask 077
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.3.0"
+VERSION="6.3.1"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
@@ -19,7 +19,7 @@ mkdir -p "$BASE" "$LAUNCH" "$BASE/reports" "$BASE/backups"
 BACKUP=$(mktemp -d "$BASE/backups/before-v6-XXXXXXXX")
 STAGE=$(mktemp -d "$BASE/install-stage-XXXXXXXX")
 mkdir -p "$BACKUP/files" "$BACKUP/LaunchAgents"
-for item in node_name push_url version monitor.sh status_engine.py dashboard.py runs_view.py show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state queue_start_epoch low_p2p_count; do
+for item in node_name push_url version monitor.sh status_engine.py dashboard.py runs_view.py show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state current_record.tsv queue_start_epoch low_p2p_count; do
   [[ ! -f "$BASE/$item" ]] || cp -p "$BASE/$item" "$BACKUP/files/$item"
 done
 trap 'echo "安装未完成。备份：$BACKUP；请保留此目录，勿上传（含 Push URL）。" >&2' ZERR
@@ -255,8 +255,14 @@ def latest_log():
     return Path(max(files, key=os.path.getmtime)) if files else None
 
 def parse(log):
+    cache = BASE / "current_record.tsv"
     try:
-        out = subprocess.check_output([sys.executable, str(ENGINE), str(log)], text=True, timeout=8).strip()
+        # Background Guardian refreshes this tiny cache every 60 seconds.
+        # Re-parse the log only once as a fallback during a fresh installation.
+        if cache.exists() and time.time() - cache.stat().st_mtime <= 120:
+            out = cache.read_text(errors="replace").strip()
+        else:
+            out = subprocess.check_output([sys.executable, str(ENGINE), str(log)], text=True, timeout=8).strip()
         values = out.split("\t")
     except Exception:
         values = ["UNKNOWN"]
@@ -482,6 +488,7 @@ APP=0; CLI=0
 (( AGE<=180 )) || finish STALE down "🔴 日志卡住 | STALE | ${AGE}秒未更新 | 程序可能失联 | 磁盘${D}%" "$AGE"
 
 RESULT=$(/usr/bin/python3 "$BASE/status_engine.py" "$LATEST" 2>/dev/null)
+print -r -- "$RESULT" > "$BASE/current_record.tsv.tmp" && mv "$BASE/current_record.tsv.tmp" "$BASE/current_record.tsv"
 IFS=$'\t' read -r STATE POS RUNID LAYER EPOCH P2P ACTIVEAGE DETAIL FAILS OKS REGERROR REGERRORAGE QUEUEWARNAGE <<< "$RESULT"
 [[ -n "${STATE:-}" ]] || STATE=UNKNOWN
 for FIELD in POS RUNID LAYER EPOCH P2P REGERROR; do
