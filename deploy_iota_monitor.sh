@@ -3,13 +3,13 @@ set -euo pipefail
 setopt null_glob
 umask 077
 
-# IOTA Guardian V6.2：精准状态判断、注册阶段诊断，并提供官方 Run 池实时查询。
+# IOTA Guardian V6.3：精准状态、注册诊断、Run 查询与本机实时仪表盘。
 [[ "$(uname -s)" == Darwin ]] || { echo "本脚本仅支持 macOS。"; exit 1; }
 [[ "$(id -u)" != 0 ]] || { echo "请使用当前登录用户运行，不要使用 sudo。"; exit 1; }
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.2.0"
+VERSION="6.3.0"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
@@ -19,13 +19,13 @@ mkdir -p "$BASE" "$LAUNCH" "$BASE/reports" "$BASE/backups"
 BACKUP=$(mktemp -d "$BASE/backups/before-v6-XXXXXXXX")
 STAGE=$(mktemp -d "$BASE/install-stage-XXXXXXXX")
 mkdir -p "$BACKUP/files" "$BACKUP/LaunchAgents"
-for item in node_name push_url version monitor.sh status_engine.py runs_view.py show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state queue_start_epoch low_p2p_count; do
+for item in node_name push_url version monitor.sh status_engine.py dashboard.py runs_view.py show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state queue_start_epoch low_p2p_count; do
   [[ ! -f "$BASE/$item" ]] || cp -p "$BASE/$item" "$BACKUP/files/$item"
 done
 trap 'echo "安装未完成。备份：$BACKUP；请保留此目录，勿上传（含 Push URL）。" >&2' ZERR
 
 echo "=============================================="
-echo " IOTA Guardian V6.2 精准状态版"
+echo " IOTA Guardian V6.3 本机仪表盘版"
 echo "=============================================="
 echo "只监控、记录、告警和清理旧日志，不控制或重启 IOTA。"
 echo
@@ -205,6 +205,146 @@ values = [state, pos or "-", run or "-", layer or "-", epoch or "-", p2p or "-",
 print("\t".join(v.replace("\t", " ").replace("\n", " ") for v in values))
 PY
 
+cat > "$STAGE/dashboard.py" <<'PY'
+#!/usr/bin/python3
+"""Local read-only terminal dashboard for IOTA Guardian."""
+import glob, os, shutil, subprocess, sys, time
+from datetime import datetime
+from pathlib import Path
+
+BASE = Path.home() / ".iota-guardian"
+LOGDIR = Path.home() / "Library/Logs/IOTA Train at Home"
+ENGINE = BASE / "status_engine.py"
+REFRESH = 10
+
+LABELS = {
+    "TRAINING": ("🟢", "真实训练"), "MERGING": ("🟡", "合并阶段"),
+    "SYNCING": ("🟡", "权重同步"), "RUN_IDLE": ("🟠", "池内等待"),
+    "INITIALIZING": ("🟠", "训练池初始化"), "CONFIRMED": ("🔵", "已到队首确认"),
+    "PROCESSING": ("🟠", "注册处理中"), "REG_FAILED": ("🔴", "注册确认失败"),
+    "QUEUED": ("🔵", "正常排队"), "RESETTING": ("🔴", "注册被重置"),
+    "CRASHED": ("🔴", "程序崩溃"), "STOPPED": ("🔴", "IOTA停止"),
+    "STALE": ("🔴", "日志卡住"), "NO_LOG": ("🔴", "没有日志"),
+    "UNKNOWN": ("🔴", "状态未确认"),
+}
+
+def duration(seconds):
+    seconds = int(seconds)
+    if seconds >= 999999:
+        return "暂无"
+    seconds = max(0, seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return (f"{h}小时{m}分钟" if h else f"{m}分{s}秒")
+
+def process_stats():
+    try:
+        out = subprocess.check_output(["/bin/ps", "-A", "-o", "%cpu=,%mem=,command="], text=True)
+        rows = [x for x in out.splitlines() if "main_pool" in x and "status_engine" not in x]
+        cpu = mem = 0.0
+        for row in rows:
+            parts = row.strip().split(None, 2)
+            if len(parts) >= 2:
+                cpu += float(parts[0]); mem += float(parts[1])
+        return bool(rows), cpu, mem
+    except Exception:
+        return False, 0.0, 0.0
+
+def latest_log():
+    files = glob.glob(str(LOGDIR / "*-cli.log"))
+    return Path(max(files, key=os.path.getmtime)) if files else None
+
+def parse(log):
+    try:
+        out = subprocess.check_output([sys.executable, str(ENGINE), str(log)], text=True, timeout=8).strip()
+        values = out.split("\t")
+    except Exception:
+        values = ["UNKNOWN"]
+    values += ["-"] * (13 - len(values))
+    return values[:13]
+
+def render():
+    node = (BASE / "node_name").read_text(errors="ignore").strip() if (BASE / "node_name").exists() else os.uname().nodename
+    version = (BASE / "version").read_text(errors="ignore").strip() if (BASE / "version").exists() else "未知"
+    log = latest_log()
+    running, cpu, mem = process_stats()
+    now = int(time.time())
+
+    if not log:
+        fields = ["NO_LOG"] + ["-"] * 12
+        age = 999999
+    else:
+        fields = parse(log)
+        age = max(0, now - int(log.stat().st_mtime))
+    state, pos, run, layer, epoch, p2p, activity_age, detail, fails, oks, reg_error, reg_age, queue_warn_age = fields
+    if not running:
+        state = "STOPPED"
+    elif age > 180:
+        state = "STALE"
+
+    icon, label = LABELS.get(state, ("🔴", "状态未确认"))
+    free = shutil.disk_usage("/").free / 1024**3
+    lines = [
+        "==============================================",
+        f"       IOTA GUARDIAN V{version} 本机实时监控",
+        "==============================================",
+        "",
+        f"机器：            {node}",
+        f"当前时间：        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        f"状态：            {icon} {state}（{label}）",
+        f"IOTA进程：        {'运行中' if running else '未运行'} | CPU {cpu:.1f}% | 内存 {mem:.1f}%",
+    ]
+    if pos != "-": lines.append(f"队列位置：        {pos}")
+    if run != "-": lines.append(f"Run：             {run}")
+    if layer != "-": lines.append(f"Layer：           {layer}")
+    if epoch != "-": lines.append(f"Epoch：           {epoch}")
+    if p2p != "-":
+        warning = ""
+        try:
+            ok, total = map(int, p2p.split("/"))
+            if total and ok * 100 < total * 25: warning = "  ⚠️ 偏低"
+        except Exception: pass
+        lines.append(f"P2P：             {p2p}{warning}")
+    lines += [
+        f"最近有效计算：    {duration(activity_age)}" if activity_age != "-" else "最近有效计算：    暂无",
+        f"判断依据：        {detail if detail != '-' else '暂无'}",
+        f"Activation：      成功ACK {oks if oks != '-' else '0'} | 失败 {fails if fails != '-' else '0'}",
+    ]
+    if reg_error != "-" and int(reg_age or 999999) <= 21600:
+        lines.append(f"最近注册问题：    {reg_error}（{duration(reg_age)}前）")
+    if queue_warn_age != "-" and int(queue_warn_age or 999999) <= 600:
+        lines.append("调度接口：        ⚠️ register.queue_state 503")
+    lines += [
+        "",
+        f"当前日志：        {log.name if log else '未找到'}",
+        f"日志最后更新：    {duration(age)}前",
+        f"磁盘可用：        {free:.1f} GB",
+        "",
+        f"每{REFRESH}秒刷新 | Ctrl+C 仅关闭此窗口，不会停止 IOTA",
+        "全部Run池：~/.iota-guardian/show_runs.sh",
+        "==============================================",
+    ]
+    sys.stdout.write("\033[2J\033[H" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+def main():
+    try:
+        while True:
+            render()
+            time.sleep(REFRESH)
+    except KeyboardInterrupt:
+        print("\n已关闭本机显示，IOTA和后台监控继续运行。")
+
+if __name__ == "__main__":
+    main()
+PY
+
+cat > "$STAGE/show_monitor.sh" <<'DASH'
+#!/bin/zsh
+exec /usr/bin/python3 "$HOME/.iota-guardian/dashboard.py"
+DASH
+
 cat > "$STAGE/runs_view.py" <<'PY'
 #!/usr/bin/python3
 """Read the public Macrocosmos Run APIs on demand; never changes local IOTA state."""
@@ -218,7 +358,7 @@ URLS = (
 RUN_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(?:-[A-Za-z0-9_-]+)?$")
 
 def fetch(url):
-    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.2", "Accept": "application/json"})
+    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.3", "Accept": "application/json"})
     with urlopen(req, timeout=12) as res:
         return json.load(res)
 
@@ -399,7 +539,7 @@ cat > "$STAGE/daily_report.sh" <<'REPORT'
 BASE="$HOME/.iota-guardian"; TODAY=$(date '+%Y-%m-%d'); S="$BASE/samples-$TODAY.csv"; R="$BASE/reports/$TODAY.txt"; mkdir -p "$BASE/reports"
 count(){ grep -c ",\"$1\"," "$S" 2>/dev/null || true; }
 cat > "$R" <<EOF2
-IOTA Guardian V6.2 每日报告
+IOTA Guardian V6.3 每日报告
 日期：$TODAY
 电脑：$(cat "$BASE/node_name" 2>/dev/null)
 真实训练：约 $(count TRAINING) 分钟
@@ -417,7 +557,7 @@ REPORT
 cat > "$STAGE/show_report.sh" <<'SHOW'
 #!/bin/zsh
 BASE="$HOME/.iota-guardian"
-echo "===== IOTA Guardian V6.2 精准状态版 ====="
+echo "===== IOTA Guardian V6.3 本机仪表盘版 ====="
 echo "版本：$(cat "$BASE/version" 2>/dev/null)"
 echo "电脑：$(cat "$BASE/node_name" 2>/dev/null)"
 echo "当前：$(cat "$BASE/current_message" 2>/dev/null)"
@@ -425,9 +565,10 @@ echo "最近状态变化："; tail -n 15 "$BASE/events.csv" 2>/dev/null
 echo; "$BASE/show_runs.sh" 2>/dev/null || true
 SHOW
 
-for item in monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do chmod 700 "$STAGE/$item"; done
-chmod 700 "$STAGE/status_engine.py" "$STAGE/runs_view.py"
+for item in monitor.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do chmod 700 "$STAGE/$item"; done
+chmod 700 "$STAGE/status_engine.py" "$STAGE/dashboard.py" "$STAGE/runs_view.py"
 /usr/bin/python3 -m py_compile "$STAGE/status_engine.py"
+/usr/bin/python3 -m py_compile "$STAGE/dashboard.py"
 /usr/bin/python3 -m py_compile "$STAGE/runs_view.py"
 
 make_plist(){
@@ -451,16 +592,17 @@ for plist in "$LAUNCH"/com.baibai.iota-log-monitor.plist "$LAUNCH"/com.baibai.io
   launchctl print "$GUI_DOMAIN/$old_label" >/dev/null 2>&1 && launchctl bootout "$GUI_DOMAIN/$old_label"
   mv "$plist" "$BACKUP/LaunchAgents/"
 done
-for item in monitor.sh status_engine.py runs_view.py show_runs.sh cleanup.sh daily_report.sh show_report.sh; do /usr/bin/install -m 700 "$STAGE/$item" "$BASE/$item"; done
+for item in monitor.sh status_engine.py dashboard.py runs_view.py show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do /usr/bin/install -m 700 "$STAGE/$item" "$BASE/$item"; done
 for item in node_name push_url version; do /usr/bin/install -m 600 "$STAGE/$item" "$BASE/$item"; done
 for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL"; do /usr/bin/install -m 600 "$STAGE/$label.plist" "$LAUNCH/$label.plist"; launchctl bootstrap "$GUI_DOMAIN" "$LAUNCH/$label.plist"; done
 mv "$STAGE" "$BACKUP/staged-install"; trap - ZERR
 
 echo
-echo "✅ IOTA Guardian V6.2 安装/升级完成"
+echo "✅ IOTA Guardian V6.3 安装/升级完成"
 echo "电脑：$(cat "$BASE/node_name")"
 echo "60秒检测一次；日志超过180秒才判定 STALE。"
 echo "TRAINING=真实计算；MERGING=合并；SYNCING=权重同步；CONFIRMED/PROCESSING=注册中；QUEUED=排队。"
 echo "查看全部 Run 池：$BASE/show_runs.sh"
+echo "打开本机实时仪表盘：$BASE/show_monitor.sh"
 echo "本工具不会启动、停止、重启或点击 IOTA，也不会修改钱包和 miner。"
 echo "请等待约60秒后查看 Uptime Kuma。"
