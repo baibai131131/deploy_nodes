@@ -9,7 +9,7 @@ umask 077
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.3.1"
+VERSION="6.3.2"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
@@ -197,6 +197,11 @@ if activity_age <= 300 and last_activity_i > barrier_i:
 elif state == "TRAINING" and activity_age > 300:
     state = "RUN_IDLE"
 
+# Queue/registration messages may contain stale peer layer data from a previous Run.
+# Until the server returns an actual Run assignment, do not present it as this miner's assignment.
+if state in {"QUEUED", "CONFIRMED", "PROCESSING", "REG_FAILED", "RESETTING"}:
+    run = layer = epoch = p2p = ""
+
 detail = last_activity_name or "无近期有效训练事件"
 reg_error_age = 999999 if reg_error_ts is None else max(0, now - reg_error_ts)
 queue_warn_age = 999999 if queue_warn_ts is None else max(0, now - queue_warn_ts)
@@ -302,6 +307,8 @@ def render():
         f"IOTA进程：        {'运行中' if running else '未运行'} | CPU {cpu:.1f}% | 内存 {mem:.1f}%",
     ]
     if pos != "-": lines.append(f"队列位置：        {pos}")
+    if state == "QUEUED": lines.append("Run：             未分配（排队中）")
+    elif state in {"CONFIRMED", "PROCESSING"}: lines.append("Run：             等待服务端分配")
     if run != "-": lines.append(f"Run：             {run}")
     if layer != "-": lines.append(f"Layer：           {layer}")
     if epoch != "-": lines.append(f"Epoch：           {epoch}")
