@@ -9,7 +9,7 @@ umask 077
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.3.2"
+VERSION="6.3.3"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
@@ -139,9 +139,10 @@ for i, line in enumerate(lines):
         set_state("STOPPED", i, ts, True); continue
     if "invalid_attestation_challenge" in low or "error registering miner" in low:
         set_state("REG_FAILED", i, ts, True); continue
-    if ("resetting miner entire state" in low or "entitynotregistered" in low or
-            "appears to have been kicked" in low or "miner.kicked" in low or
-            "miner not registered error" in low):
+    # EntityNotRegistered/get_run_config is normal while queued. Only explicit reset/kick
+    # events prove that an existing registration was actually discarded.
+    if ("resetting miner entire state" in low or
+            "appears to have been kicked" in low or "miner.kicked" in low):
         set_state("RESETTING", i, ts, True); continue
     if re.search(r"status['\"]?\s*:\s*['\"]failed", low):
         pos = ""
