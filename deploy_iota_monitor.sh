@@ -3,13 +3,13 @@ set -euo pipefail
 setopt null_glob
 umask 077
 
-# IOTA Guardian V6.0：按最新事件和活动时效判断真实状态，兼容 TAH 3.7 / 4.12.x。
+# IOTA Guardian V6.1：精准状态判断，并提供官方 Run 池实时查询。
 [[ "$(uname -s)" == Darwin ]] || { echo "本脚本仅支持 macOS。"; exit 1; }
 [[ "$(id -u)" != 0 ]] || { echo "请使用当前登录用户运行，不要使用 sudo。"; exit 1; }
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.0.0"
+VERSION="6.1.0"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
@@ -19,13 +19,13 @@ mkdir -p "$BASE" "$LAUNCH" "$BASE/reports" "$BASE/backups"
 BACKUP=$(mktemp -d "$BASE/backups/before-v6-XXXXXXXX")
 STAGE=$(mktemp -d "$BASE/install-stage-XXXXXXXX")
 mkdir -p "$BACKUP/files" "$BACKUP/LaunchAgents"
-for item in node_name push_url version monitor.sh status_engine.py cleanup.sh daily_report.sh show_report.sh last_state queue_start_epoch low_p2p_count; do
+for item in node_name push_url version monitor.sh status_engine.py runs_view.py show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state queue_start_epoch low_p2p_count; do
   [[ ! -f "$BASE/$item" ]] || cp -p "$BASE/$item" "$BACKUP/files/$item"
 done
 trap 'echo "安装未完成。备份：$BACKUP；请保留此目录，勿上传（含 Push URL）。" >&2' ZERR
 
 echo "=============================================="
-echo " IOTA Guardian V6.0 精准状态版"
+echo " IOTA Guardian V6.1 精准状态版"
 echo "=============================================="
 echo "只监控、记录、告警和清理旧日志，不控制或重启 IOTA。"
 echo
@@ -175,6 +175,95 @@ values = [state, pos, run, layer, epoch, p2p, str(activity_age), detail, str(sen
 print("\t".join(v.replace("\t", " ").replace("\n", " ") for v in values))
 PY
 
+cat > "$STAGE/runs_view.py" <<'PY'
+#!/usr/bin/python3
+"""Read the public Macrocosmos Run APIs on demand; never changes local IOTA state."""
+import json, re, sys
+from urllib.request import Request, urlopen
+
+URLS = (
+    "https://iota-web.api.macrocosmos.ai/mainnet/runs",
+    "https://iota-web.api.macrocosmos.ai/mainnet/v1/runs_occupancy",
+)
+RUN_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(?:-[A-Za-z0-9_-]+)?$")
+
+def fetch(url):
+    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.1", "Accept": "application/json"})
+    with urlopen(req, timeout=12) as res:
+        return json.load(res)
+
+def walk(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk(child)
+
+def run_id(obj):
+    for key in ("run_id", "run", "id", "name"):
+        value = obj.get(key)
+        if isinstance(value, str) and RUN_RE.match(value):
+            return value
+    return ""
+
+def first_number(obj, keys):
+    for key in keys:
+        value = obj.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+try:
+    runs_data = fetch(URLS[0])
+except Exception as exc:
+    print("官方 Run 接口暂时无法访问：" + str(exc))
+    print("这只影响池子查询，不影响本机监控和 IOTA 训练。")
+    raise SystemExit(1)
+
+try:
+    occupancy_data = fetch(URLS[1])
+except Exception:
+    occupancy_data = {}
+
+runs = {}
+for obj in walk(runs_data):
+    rid = run_id(obj)
+    if rid:
+        runs.setdefault(rid, {}).update(obj)
+for obj in walk(occupancy_data):
+    rid = run_id(obj)
+    if rid:
+        runs.setdefault(rid, {}).update(obj)
+
+def key(rid):
+    return tuple(int(x) for x in re.findall(r"\d+", rid)[:4])
+
+print("===== Macrocosmos IOTA 当前 Run 池 =====")
+if not runs:
+    print("接口已响应，但没有识别到 Run；项目方可能调整了接口格式。")
+    raise SystemExit(2)
+for rid in sorted(runs, key=key, reverse=True):
+    obj = runs[rid]
+    used = first_number(obj, ("active_miners", "current_miners", "miners", "occupied", "occupancy", "current"))
+    cap = first_number(obj, ("max_miners", "capacity", "total_slots", "max_nodes", "total"))
+    status = obj.get("status") or ("active" if obj.get("active") is True or obj.get("is_active") is True else "")
+    detail = []
+    if status: detail.append(str(status))
+    if used is not None and cap is not None:
+        detail.append(f"{used}/{cap}，空位{max(0, cap-used)}")
+    elif used is not None: detail.append(f"当前{used}")
+    elif cap is not None: detail.append(f"容量{cap}")
+    print(f"{rid}" + (" | " + " | ".join(detail) if detail else ""))
+print(f"合计识别：{len(runs)} 个 Run")
+PY
+
+cat > "$STAGE/show_runs.sh" <<'RUNS'
+#!/bin/zsh
+/usr/bin/python3 "$HOME/.iota-guardian/runs_view.py"
+RUNS
+
 cat > "$STAGE/monitor.sh" <<'MONITOR'
 #!/bin/zsh
 set -u
@@ -267,7 +356,7 @@ cat > "$STAGE/daily_report.sh" <<'REPORT'
 BASE="$HOME/.iota-guardian"; TODAY=$(date '+%Y-%m-%d'); S="$BASE/samples-$TODAY.csv"; R="$BASE/reports/$TODAY.txt"; mkdir -p "$BASE/reports"
 count(){ grep -c ",\"$1\"," "$S" 2>/dev/null || true; }
 cat > "$R" <<EOF2
-IOTA Guardian V6.0 每日报告
+IOTA Guardian V6.1 每日报告
 日期：$TODAY
 电脑：$(cat "$BASE/node_name" 2>/dev/null)
 真实训练：约 $(count TRAINING) 分钟
@@ -284,16 +373,18 @@ REPORT
 cat > "$STAGE/show_report.sh" <<'SHOW'
 #!/bin/zsh
 BASE="$HOME/.iota-guardian"
-echo "===== IOTA Guardian V6.0 精准状态版 ====="
+echo "===== IOTA Guardian V6.1 精准状态版 ====="
 echo "版本：$(cat "$BASE/version" 2>/dev/null)"
 echo "电脑：$(cat "$BASE/node_name" 2>/dev/null)"
 echo "当前：$(cat "$BASE/current_message" 2>/dev/null)"
 echo "最近状态变化："; tail -n 15 "$BASE/events.csv" 2>/dev/null
+echo; "$BASE/show_runs.sh" 2>/dev/null || true
 SHOW
 
-for item in monitor.sh cleanup.sh daily_report.sh show_report.sh; do chmod 700 "$STAGE/$item"; done
-chmod 700 "$STAGE/status_engine.py"
+for item in monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do chmod 700 "$STAGE/$item"; done
+chmod 700 "$STAGE/status_engine.py" "$STAGE/runs_view.py"
 /usr/bin/python3 -m py_compile "$STAGE/status_engine.py"
+/usr/bin/python3 -m py_compile "$STAGE/runs_view.py"
 
 make_plist(){
   local label="$1" script="$2" schedule="$3"
@@ -316,15 +407,16 @@ for plist in "$LAUNCH"/com.baibai.iota-log-monitor.plist "$LAUNCH"/com.baibai.io
   launchctl print "$GUI_DOMAIN/$old_label" >/dev/null 2>&1 && launchctl bootout "$GUI_DOMAIN/$old_label"
   mv "$plist" "$BACKUP/LaunchAgents/"
 done
-for item in monitor.sh status_engine.py cleanup.sh daily_report.sh show_report.sh; do /usr/bin/install -m 700 "$STAGE/$item" "$BASE/$item"; done
+for item in monitor.sh status_engine.py runs_view.py show_runs.sh cleanup.sh daily_report.sh show_report.sh; do /usr/bin/install -m 700 "$STAGE/$item" "$BASE/$item"; done
 for item in node_name push_url version; do /usr/bin/install -m 600 "$STAGE/$item" "$BASE/$item"; done
 for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL"; do /usr/bin/install -m 600 "$STAGE/$label.plist" "$LAUNCH/$label.plist"; launchctl bootstrap "$GUI_DOMAIN" "$LAUNCH/$label.plist"; done
 mv "$STAGE" "$BACKUP/staged-install"; trap - ZERR
 
 echo
-echo "✅ IOTA Guardian V6.0 安装/升级完成"
+echo "✅ IOTA Guardian V6.1 安装/升级完成"
 echo "电脑：$(cat "$BASE/node_name")"
 echo "60秒检测一次；日志超过180秒才判定 STALE。"
 echo "TRAINING=真实计算；MERGING=合并；SYNCING=权重同步；RUN_IDLE=池内等待；QUEUED=排队。"
+echo "查看全部 Run 池：$BASE/show_runs.sh"
 echo "本工具不会启动、停止、重启或点击 IOTA，也不会修改钱包和 miner。"
 echo "请等待约60秒后查看 Uptime Kuma。"
