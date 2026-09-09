@@ -4,13 +4,15 @@ set -Eeuo pipefail
 # Quantus macOS Apple Silicon safe wrapper
 # Uses only the official Quantus installer and refuses to treat Planck testnet as mainnet.
 
-WRAPPER_VERSION="2.0.1"
+WRAPPER_VERSION="2.1.0"
 
 OFFICIAL_URL="https://docs.quantus.com/scripts/quantus-mining.sh"
 SELF_URL="https://raw.githubusercontent.com/baibai131131/deploy_nodes/main/deploy_quantus_mac.sh"
 BASE_DIR="${HOME}/quantus-mining"
 OFFICIAL_SCRIPT="${BASE_DIR}/quantus-mining.sh"
+OFFICIAL_SOURCE="${BASE_DIR}/quantus-mining.official.sh"
 CONFIG_FILE="${BASE_DIR}/mining.conf"
+NODE_NAME_FILE="${BASE_DIR}/node-name"
 ACTION="${1:-install}"
 
 info() { printf '\033[1;32m[Quantus] %s\033[0m\n' "$*"; }
@@ -41,9 +43,56 @@ download_official() {
   grep -q 'readonly MINER_REPO="Quantus-Network/quantus-miner"' "$tmp" || die "官方矿工仓库标识不匹配，已停止。"
   grep -q 'NODE_TARGET="aarch64-apple-darwin"' "$tmp" || die "官方安装器缺少 Apple Silicon 节点目标，已停止。"
   grep -q 'MINER_ASSET="quantus-miner-macos-aarch64"' "$tmp" || die "官方安装器缺少 Apple Silicon 矿工目标，已停止。"
-  install -m 700 "$tmp" "$OFFICIAL_SCRIPT"
-  info "官方安装器已保存：$OFFICIAL_SCRIPT"
-  info "SHA-256：$(shasum -a 256 "$OFFICIAL_SCRIPT" | awk '{print $1}')"
+  install -m 700 "$tmp" "$OFFICIAL_SOURCE"
+  info "官方原始安装器 SHA-256：$(shasum -a 256 "$OFFICIAL_SOURCE" | awk '{print $1}')"
+
+  # Preserve the official source verbatim. The runnable copy changes exactly one
+  # prompt so NODE_NAME can be supplied by this wrapper without touching wallet input.
+  local patched
+  patched="${tmp}.patched"
+  if ! awk '
+    /^[[:space:]]*read -r -p "Enter a node name \(shown on telemetry\): " NODE_NAME[[:space:]]*$/ {
+      print "  if [ -z \"${NODE_NAME:-}\" ]; then"
+      print "    read -r -p \"Enter a node name (shown on telemetry): \" NODE_NAME"
+      print "  fi"
+      replaced++
+      next
+    }
+    { print }
+    END { if (replaced != 1) exit 42 }
+  ' "$OFFICIAL_SOURCE" > "$patched"; then
+    rm -f "$patched"
+    die "官方安装器的节点名称输入结构发生变化，安全停止。"
+  fi
+  /bin/bash -n "$patched" || die "名称自动化适配后语法检查失败，已停止。"
+  install -m 700 "$patched" "$OFFICIAL_SCRIPT"
+  rm -f "$patched"
+  info "官方安装器已保存；仅适配了自动节点名称输入。"
+}
+
+auto_node_name() {
+  local existing token name
+  if [ -s "$NODE_NAME_FILE" ]; then
+    existing="$(tr -cd 'A-Za-z0-9._-' < "$NODE_NAME_FILE" | head -c 48)"
+    [ -n "$existing" ] && { printf '%s' "$existing"; return 0; }
+  fi
+  existing="$(config_value NODE_NAME 2>/dev/null || true)"
+  if [ -n "$existing" ]; then
+    printf '%s\n' "$existing" > "$NODE_NAME_FILE"
+    chmod 600 "$NODE_NAME_FILE"
+    printf '%s' "$existing"
+    return 0
+  fi
+  if command -v uuidgen >/dev/null 2>&1; then
+    token="$(uuidgen | tr -d '-' | tr '[:lower:]' '[:upper:]' | head -c 10)"
+  else
+    token="$(date '+%s')${RANDOM}${RANDOM}"
+    token="$(printf '%s' "$token" | shasum -a 256 | awk '{print toupper(substr($1,1,10))}')"
+  fi
+  name="Quantus-${token}"
+  printf '%s\n' "$name" > "$NODE_NAME_FILE"
+  chmod 600 "$NODE_NAME_FILE"
+  printf '%s' "$name"
 }
 
 official_default_chain() {
@@ -89,9 +138,12 @@ require_official_mainnet() {
 }
 
 install_or_prepare() {
+  local node_name
   download_official
+  node_name="$(auto_node_name)"
+  info "本机自动节点名称：$node_name"
   info "开始官方交互式 setup。期间生成/导入24词钱包时，请自己离线保存；不要发给任何人。"
-  "$OFFICIAL_SCRIPT" setup
+  NODE_NAME="$node_name" "$OFFICIAL_SCRIPT" setup
 
   # Coexistence profile for M4: Metal GPU enabled; no extra CPU workers by default.
   "$OFFICIAL_SCRIPT" config set CPU_WORKERS "${CPU_WORKERS:-0}" || true
@@ -106,7 +158,7 @@ install_or_prepare() {
 }
 
 update_install() {
-  local official_c backup_stamp
+  local official_c backup_stamp node_name
   download_official
   official_c="$(official_default_chain 2>/dev/null || true)"
   case "$(printf '%s' "$official_c" | tr '[:upper:]' '[:lower:]')" in
@@ -116,8 +168,9 @@ update_install() {
   esac
   backup_stamp="$(date '+%Y%m%d_%H%M%S')"
   [ ! -f "$CONFIG_FILE" ] || cp -p "$CONFIG_FILE" "${CONFIG_FILE}.backup_${backup_stamp}"
+  node_name="$(auto_node_name)"
   info "官方默认链已变更为 '$official_c'，刷新官方节点与矿工匹配版本……"
-  CHAIN="$official_c" "$OFFICIAL_SCRIPT" setup --force
+  NODE_NAME="$node_name" CHAIN="$official_c" "$OFFICIAL_SCRIPT" setup --force
   info "更新完成。当前 CHAIN=$(chain_name)"
   require_official_mainnet
 }
@@ -126,6 +179,7 @@ show_status() {
   printf '\n===== Quantus 状态 =====\n'
   printf '一键脚本：v%s\n' "$WRAPPER_VERSION"
   printf '目录：%s\n' "$BASE_DIR"
+  printf '节点名称：%s\n' "$(auto_node_name)"
   printf '链：%s\n' "$(chain_name)"
   printf '官方安装器默认链：%s\n' "$(official_default_chain 2>/dev/null || printf unknown)"
   if pgrep -f '[q]uantus-node' >/dev/null 2>&1; then printf '节点：运行中\n'; else printf '节点：未运行\n'; fi
