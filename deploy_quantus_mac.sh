@@ -4,6 +4,8 @@ set -Eeuo pipefail
 # Quantus macOS Apple Silicon safe wrapper
 # Uses only the official Quantus installer and refuses to treat Planck testnet as mainnet.
 
+WRAPPER_VERSION="2.0.0"
+
 OFFICIAL_URL="https://docs.quantus.com/scripts/quantus-mining.sh"
 SELF_URL="https://raw.githubusercontent.com/baibai131131/deploy_nodes/main/deploy_quantus_mac.sh"
 BASE_DIR="${HOME}/quantus-mining"
@@ -35,10 +37,18 @@ download_official() {
     "$OFFICIAL_URL" -o "$tmp"
   [ -s "$tmp" ] || die "官方安装器下载为空。"
   /bin/bash -n "$tmp" || die "官方安装器语法检查失败，已停止。"
-  grep -q 'quantus' "$tmp" || die "下载内容不像 Quantus 官方安装器，已停止。"
+  grep -q 'readonly CHAIN_REPO="Quantus-Network/chain"' "$tmp" || die "官方节点仓库标识不匹配，已停止。"
+  grep -q 'readonly MINER_REPO="Quantus-Network/quantus-miner"' "$tmp" || die "官方矿工仓库标识不匹配，已停止。"
+  grep -q 'NODE_TARGET="aarch64-apple-darwin"' "$tmp" || die "官方安装器缺少 Apple Silicon 节点目标，已停止。"
+  grep -q 'MINER_ASSET="quantus-miner-macos-aarch64"' "$tmp" || die "官方安装器缺少 Apple Silicon 矿工目标，已停止。"
   install -m 700 "$tmp" "$OFFICIAL_SCRIPT"
   info "官方安装器已保存：$OFFICIAL_SCRIPT"
   info "SHA-256：$(shasum -a 256 "$OFFICIAL_SCRIPT" | awk '{print $1}')"
+}
+
+official_default_chain() {
+  [ -f "$OFFICIAL_SCRIPT" ] || return 1
+  sed -n 's/^[[:space:]]*CHAIN="${CHAIN:-\([^}"]*\)}".*/\1/p' "$OFFICIAL_SCRIPT" | head -n 1
 }
 
 config_value() {
@@ -57,15 +67,25 @@ chain_name() {
   printf '%s' "${c:-unknown}"
 }
 
-refuse_testnet() {
-  local c
+require_official_mainnet() {
+  local c official_c node_v miner_v protocol
   c="$(chain_name)"
-  case "$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')" in
+  official_c="$(official_default_chain 2>/dev/null || true)"
+
+  case "$(printf '%s' "$official_c" | tr '[:upper:]' '[:lower:]')" in
     planck|testnet|unknown|'')
-      die "当前链为 '$c'，仍是测试网或尚未确认主网。不会启动挖矿。等官方发布主网参数后先运行：$(self_command update)"
+      die "Quantus 官方安装器默认链仍为 '${official_c:-unknown}'，尚未确认主网；不会启动。"
       ;;
   esac
-  info "已确认配置链：$c"
+
+  [ "$c" = "$official_c" ] || die "本机配置链 '$c' 与官方链 '$official_c' 不一致。请先运行：$(self_command update)"
+  node_v="$(config_value NODE_VERSION 2>/dev/null || true)"
+  miner_v="$(config_value MINER_VERSION 2>/dev/null || true)"
+  protocol="$(config_value MINER_PROTOCOL 2>/dev/null || true)"
+  [ -n "$node_v" ] || die "配置缺少 NODE_VERSION，不允许启动。"
+  [ -n "$miner_v" ] || die "配置缺少 MINER_VERSION，不允许启动。"
+  [ "$protocol" = "auth" ] || die "节点与矿工没有确认 quantus-miner/2 认证协议匹配，不允许启动。"
+  info "官方主网核对通过：CHAIN=$c，NODE=$node_v，MINER=$miner_v，PROTOCOL=$protocol"
 }
 
 install_or_prepare() {
@@ -86,19 +106,28 @@ install_or_prepare() {
 }
 
 update_install() {
+  local official_c backup_stamp
   download_official
-  info "刷新官方节点与矿工版本……"
-  "$OFFICIAL_SCRIPT" setup --force
+  official_c="$(official_default_chain 2>/dev/null || true)"
+  case "$(printf '%s' "$official_c" | tr '[:upper:]' '[:lower:]')" in
+    planck|testnet|unknown|'')
+      die "官方安装器默认链仍为 '${official_c:-unknown}'。没有更新主网配置，也没有启动。"
+      ;;
+  esac
+  backup_stamp="$(date '+%Y%m%d_%H%M%S')"
+  [ ! -f "$CONFIG_FILE" ] || cp -p "$CONFIG_FILE" "${CONFIG_FILE}.backup_${backup_stamp}"
+  info "官方默认链已变更为 '$official_c'，刷新官方节点与矿工匹配版本……"
+  CHAIN="$official_c" "$OFFICIAL_SCRIPT" setup --force
   info "更新完成。当前 CHAIN=$(chain_name)"
-  if [ "$(printf '%s' "$(chain_name)" | tr '[:upper:]' '[:lower:]')" = "planck" ]; then
-    warn "官方配置仍是 Planck 测试网，不要启动主网挖矿。"
-  fi
+  require_official_mainnet
 }
 
 show_status() {
   printf '\n===== Quantus 状态 =====\n'
+  printf '一键脚本：v%s\n' "$WRAPPER_VERSION"
   printf '目录：%s\n' "$BASE_DIR"
   printf '链：%s\n' "$(chain_name)"
+  printf '官方安装器默认链：%s\n' "$(official_default_chain 2>/dev/null || printf unknown)"
   if pgrep -f '[q]uantus-node' >/dev/null 2>&1; then printf '节点：运行中\n'; else printf '节点：未运行\n'; fi
   if pgrep -f '[q]uantus-miner' >/dev/null 2>&1; then printf '矿工：运行中\n'; else printf '矿工：未运行\n'; fi
   [ -x "$OFFICIAL_SCRIPT" ] && "$OFFICIAL_SCRIPT" config show || true
@@ -123,7 +152,8 @@ case "$ACTION" in
   update) update_install ;;
   start)
     [ -x "$OFFICIAL_SCRIPT" ] || die "尚未安装，请先运行 install。"
-    refuse_testnet
+    download_official
+    require_official_mainnet
     info "后台启动 Quantus 节点和矿工……"
     "$OFFICIAL_SCRIPT" start --detach
     show_status
@@ -139,7 +169,8 @@ case "$ACTION" in
     ;;
   restart)
     [ -x "$OFFICIAL_SCRIPT" ] || die "尚未安装。"
-    refuse_testnet
+    download_official
+    require_official_mainnet
     "$OFFICIAL_SCRIPT" stop || true
     "$OFFICIAL_SCRIPT" start --detach
     ;;
@@ -151,7 +182,7 @@ case "$ACTION" in
     "$OFFICIAL_SCRIPT" uninstall
     ;;
   help|-h|--help)
-    printf 'Quantus Mac 一键脚本\n\n'
+    printf 'Quantus Mac 一键脚本 v%s\n\n' "$WRAPPER_VERSION"
     printf '安装准备：%s\n' "$(self_command install)"
     printf '更新版本：%s\n' "$(self_command update)"
     printf '查看状态：%s\n' "$(self_command status)"
