@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Quantus macOS Apple Silicon safe wrapper
 # Uses only the official Quantus installer and refuses to treat Planck testnet as mainnet.
 
-WRAPPER_VERSION="2.0.0"
+WRAPPER_VERSION="2.0.1"
 
 OFFICIAL_URL="https://docs.quantus.com/scripts/quantus-mining.sh"
 SELF_URL="https://raw.githubusercontent.com/baibai131131/deploy_nodes/main/deploy_quantus_mac.sh"
@@ -93,8 +93,8 @@ install_or_prepare() {
   info "开始官方交互式 setup。期间生成/导入24词钱包时，请自己离线保存；不要发给任何人。"
   "$OFFICIAL_SCRIPT" setup
 
-  # Balanced profile for M4: Metal GPU enabled, limited CPU contention.
-  "$OFFICIAL_SCRIPT" config set CPU_WORKERS "${CPU_WORKERS:-2}" || true
+  # Coexistence profile for M4: Metal GPU enabled; no extra CPU workers by default.
+  "$OFFICIAL_SCRIPT" config set CPU_WORKERS "${CPU_WORKERS:-0}" || true
   "$OFFICIAL_SCRIPT" config set GPU_DEVICES "${GPU_DEVICES:-1}" || true
 
   info "准备完成。当前 CHAIN=$(chain_name)"
