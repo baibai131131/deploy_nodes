@@ -4,22 +4,29 @@ set -Eeuo pipefail
 # Dedicated, single-protocol VPS installer for IOTA traffic.
 # Transport: VLESS + REALITY + TCP + XTLS-Vision (sing-box core).
 
-readonly SCRIPT_VERSION="1.0.0"
+# Production profile for long-running IOTA traffic on macOS clients.
+# Design choices: one TCP/443 protocol, no application-layer multiplexing,
+# no scheduled restarts, and no UDP/QUIC dependency for the outer tunnel.
+readonly SCRIPT_VERSION="1.1.0"
 readonly SING_BOX_VERSION="1.13.21"
 readonly CONFIG_DIR="/etc/sing-box"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly STATE_DIR="/etc/iota-singbox-reality"
 readonly INFO_FILE="/root/IOTA_SINGBOX_REALITY_INFO.txt"
 readonly CLASH_FILE="/root/IOTA_SINGBOX_REALITY_CLASH.yaml"
+readonly URI_FILE="/root/IOTA_SINGBOX_REALITY_URI.txt"
+readonly BASE64_FILE="/root/IOTA_SINGBOX_REALITY_BASE64.txt"
+readonly SINGBOX_CLIENT_FILE="/root/IOTA_SINGBOX_REALITY_CLIENT.json"
 readonly SUB_DIR="/var/lib/iota-singbox-subscription"
 readonly SUB_SERVER="/usr/local/sbin/iota-singbox-subscription.py"
 readonly SUB_SERVICE="/etc/systemd/system/iota-singbox-subscription.service"
+readonly MANAGER="/usr/local/sbin/iota-reality"
 readonly INSTALL_URL="https://sing-box.app/install.sh"
 
 VLESS_PORT=${VLESS_PORT:-443}
 SUB_PORT=${SUB_PORT:-18080}
-REALITY_SNI=${REALITY_SNI:-www.apple.com}
-REALITY_TARGET=${REALITY_TARGET:-www.apple.com}
+REALITY_SNI=${REALITY_SNI:-}
+REALITY_TARGET=${REALITY_TARGET:-}
 
 log()  { printf '[信息] %s\n' "$*"; }
 warn() { printf '[警告] %s\n' "$*" >&2; }
@@ -62,8 +69,12 @@ check_system() {
   validate_number VLESS_PORT "$VLESS_PORT"
   validate_number SUB_PORT "$SUB_PORT"
   (( VLESS_PORT != SUB_PORT )) || die "VLESS_PORT 与 SUB_PORT 不能相同。"
-  [[ $REALITY_SNI =~ ^[A-Za-z0-9.-]+$ ]] || die "REALITY_SNI 格式不正确。"
-  [[ $REALITY_TARGET =~ ^[A-Za-z0-9.-]+$ ]] || die "REALITY_TARGET 格式不正确。"
+  if [[ -n $REALITY_SNI ]]; then
+    [[ $REALITY_SNI =~ ^[A-Za-z0-9.-]+$ ]] || die "REALITY_SNI 格式不正确。"
+  fi
+  if [[ -n $REALITY_TARGET ]]; then
+    [[ $REALITY_TARGET =~ ^[A-Za-z0-9.-]+$ ]] || die "REALITY_TARGET 格式不正确。"
+  fi
 }
 
 refuse_conflicting_proxy() {
@@ -111,15 +122,33 @@ install_dependencies() {
     ca-certificates curl openssl iproute2 python3
 }
 
-check_reality_target() {
-  log "检查 REALITY 目标站点 ${REALITY_TARGET}:443……"
-  local result
-  result=$(timeout 12 openssl s_client \
-    -connect "${REALITY_TARGET}:443" \
-    -servername "$REALITY_SNI" </dev/null 2>&1 || true)
-  grep -q 'CONNECTED' <<<"$result" || die "VPS 无法连接 REALITY 目标站点。"
-  grep -Eq 'Verify return code: 0 \(ok\)' <<<"$result" \
-    || die "REALITY 目标站点证书校验失败。"
+select_reality_target() {
+  local target sni result
+  local -a candidates=(
+    "www.microsoft.com|www.microsoft.com"
+    "www.apple.com|www.apple.com"
+    "www.cloudflare.com|www.cloudflare.com"
+  )
+  if [[ -n $REALITY_TARGET || -n $REALITY_SNI ]]; then
+    [[ -n $REALITY_TARGET && -n $REALITY_SNI ]] \
+      || die "自定义目标时必须同时设置 REALITY_TARGET 和 REALITY_SNI。"
+    candidates=("${REALITY_TARGET}|${REALITY_SNI}")
+  fi
+  for target_sni in "${candidates[@]}"; do
+    target=${target_sni%%|*}
+    sni=${target_sni#*|}
+    log "检查 REALITY 目标站点 ${target}:443……"
+    result=$(timeout 12 openssl s_client \
+      -connect "${target}:443" -servername "$sni" </dev/null 2>&1 || true)
+    if grep -q 'CONNECTED' <<<"$result" && \
+       grep -Eq 'Verify return code: 0 \(ok\)' <<<"$result"; then
+      REALITY_TARGET=$target
+      REALITY_SNI=$sni
+      log "已选择 REALITY 目标：${REALITY_TARGET}"
+      return
+    fi
+  done
+  die "没有找到可用的 REALITY 目标站点；请检查 VPS 出口网络和 DNS。"
 }
 
 install_sing_box() {
@@ -253,6 +282,23 @@ EOF
   ss -lntH "sport = :${VLESS_PORT}" | grep -q . || die "sing-box 未监听 TCP ${VLESS_PORT}。"
 }
 
+configure_tcp_stability() {
+  local congestion=""
+  if [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]] && \
+     grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
+    congestion=$'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr'
+  fi
+  cat >/etc/sysctl.d/99-iota-reality.conf <<EOF
+# Conservative keepalive for long-running IOTA proxy connections.
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_keepalive_probes=4
+${congestion}
+EOF
+  sysctl --system >/dev/null
+  log "TCP 长连接参数已应用。"
+}
+
 open_firewall() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow "${VLESS_PORT}/tcp" >/dev/null
@@ -316,8 +362,13 @@ JSON
     kill -0 "$client_pid" 2>/dev/null || break
     sleep 0.1
   done
-  result=$(curl -4fsS --socks5-hostname "127.0.0.1:${socks_port}" \
-    --connect-timeout 10 --max-time 25 https://api.ipify.org 2>/dev/null || true)
+  result=""
+  for _ in {1..3}; do
+    result=$(curl -4fsS --socks5-hostname "127.0.0.1:${socks_port}" \
+      --connect-timeout 10 --max-time 25 https://api.ipify.org 2>/dev/null || true)
+    [[ -n $result ]] && break
+    sleep 1
+  done
   kill "$client_pid" 2>/dev/null || true
   wait "$client_pid" 2>/dev/null || true
   if ! python3 - "$result" <<'PY'
@@ -343,20 +394,20 @@ PY
 write_client_files() {
   local ip=$1 uuid=$2 public_key=$3 short_id=$4
   local vless_link
-  vless_link="vless://${uuid}@${ip}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#IOTA-SINGBOX-REALITY"
+  vless_link="vless://${uuid}@${ip}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#IOTA-REALITY-TCP"
   cat >"$CLASH_FILE" <<YAML
 mixed-port: 7890
 allow-lan: false
 mode: rule
 log-level: info
-ipv6: true
+ipv6: false
 unified-delay: true
 tcp-concurrent: true
 profile:
   store-selected: true
 
 proxies:
-  - name: IOTA-SINGBOX-REALITY
+  - name: IOTA-REALITY-TCP
     type: vless
     server: ${ip}
     port: ${VLESS_PORT}
@@ -371,20 +422,70 @@ proxies:
       short-id: ${short_id}
     client-fingerprint: chrome
     packet-encoding: xudp
+    smux:
+      enabled: false
 
 proxy-groups:
   - name: 节点选择
     type: select
     proxies:
-      - IOTA-SINGBOX-REALITY
+      - IOTA-REALITY-TCP
 
 rules:
   - MATCH,节点选择
 YAML
+  printf '%s\n' "$vless_link" >"$URI_FILE"
+  printf '%s' "$vless_link" | base64 -w 0 >"$BASE64_FILE"
+  printf '\n' >>"$BASE64_FILE"
+  cat >"$SINGBOX_CLIENT_FILE" <<JSON
+{
+  "log": {"level": "info", "timestamp": true},
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.19.0.1/30"],
+      "auto_route": true,
+      "strict_route": false,
+      "stack": "mixed"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "IOTA-REALITY-TCP",
+      "server": "${ip}",
+      "server_port": ${VLESS_PORT},
+      "uuid": "${uuid}",
+      "flow": "xtls-rprx-vision",
+      "network": "tcp",
+      "tcp_keep_alive": "1m",
+      "tcp_keep_alive_interval": "15s",
+      "multiplex": {"enabled": false},
+      "tls": {
+        "enabled": true,
+        "server_name": "${REALITY_SNI}",
+        "utls": {"enabled": true, "fingerprint": "chrome"},
+        "reality": {
+          "enabled": true,
+          "public_key": "${public_key}",
+          "short_id": "${short_id}"
+        }
+      }
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "final": "IOTA-REALITY-TCP"
+  }
+}
+JSON
+  sing-box check -c "$SINGBOX_CLIENT_FILE"
   cat >"$INFO_FILE" <<EOF
 安装器版本：${SCRIPT_VERSION}
 核心版本：sing-box ${SING_BOX_VERSION}
 协议：VLESS + REALITY + TCP + XTLS-Vision
+多路复用：关闭（SMUX/MUX disabled）
 VPS公网IPv4：${ip}
 端口：${VLESS_PORT}/TCP
 REALITY SNI：${REALITY_SNI}
@@ -392,17 +493,30 @@ REALITY SNI：${REALITY_SNI}
 VLESS分享链接：
 ${vless_link}
 
-Clash配置文件：${CLASH_FILE}
+Clash/Stash配置文件：${CLASH_FILE}
+Hiddify通用订阅内容：${BASE64_FILE}
+sing-box客户端配置：${SINGBOX_CLIENT_FILE}
+
+管理命令：
+iota-reality status   # 查看服务和端口
+iota-reality check    # 快速检查
+iota-reality restart  # 仅在确有故障时手动重启
+iota-reality logs 100 # 查看最近100行日志
+iota-reality show     # 重新显示节点资料
 EOF
-  chmod 600 "$CLASH_FILE" "$INFO_FILE"
+  chmod 600 "$CLASH_FILE" "$URI_FILE" "$BASE64_FILE" \
+    "$SINGBOX_CLIENT_FILE" "$INFO_FILE"
 }
 
 install_subscription_service() {
-  local ip=$1 token subscription_url local_content
+  local ip=$1 token base_url local_content
   install -d -o root -g www-data -m 750 "$SUB_DIR"
   token=$(openssl rand -hex 24)
   printf '%s\n' "$token" >"$SUB_DIR/token"
-  install -o root -g www-data -m 640 "$CLASH_FILE" "$SUB_DIR/config.yaml"
+  install -o root -g www-data -m 640 "$CLASH_FILE" "$SUB_DIR/clash.yaml"
+  install -o root -g www-data -m 640 "$URI_FILE" "$SUB_DIR/vless.txt"
+  install -o root -g www-data -m 640 "$BASE64_FILE" "$SUB_DIR/base64.txt"
+  install -o root -g www-data -m 640 "$SINGBOX_CLIENT_FILE" "$SUB_DIR/singbox.json"
   chown root:www-data "$SUB_DIR/token"
   chmod 640 "$SUB_DIR/token"
   cat >"$SUB_SERVER" <<'PY'
@@ -414,21 +528,31 @@ from pathlib import Path
 p = argparse.ArgumentParser()
 p.add_argument("--port", type=int, required=True)
 p.add_argument("--token-file", required=True)
-p.add_argument("--config", required=True)
+p.add_argument("--directory", required=True)
 a = p.parse_args()
 token = Path(a.token_file).read_text(encoding="utf-8").strip()
-config = Path(a.config)
+directory = Path(a.directory)
+files = {
+    "clash.yaml": ("clash.yaml", "text/yaml; charset=utf-8"),
+    "vless.txt": ("vless.txt", "text/plain; charset=utf-8"),
+    "base64.txt": ("base64.txt", "text/plain; charset=utf-8"),
+    "singbox.json": ("singbox.json", "application/json; charset=utf-8"),
+}
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path != "/" + token:
+        path = self.path.split("?", 1)[0].strip("/")
+        parts = path.split("/")
+        if len(parts) != 2 or parts[0] != token or parts[1] not in files:
             self.send_error(404)
             return
-        body = config.read_bytes()
+        filename, content_type = files[parts[1]]
+        body = (directory / filename).read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", "text/yaml; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -448,7 +572,7 @@ Wants=network-online.target
 Type=simple
 User=www-data
 Group=www-data
-ExecStart=/usr/bin/python3 ${SUB_SERVER} --port ${SUB_PORT} --token-file ${SUB_DIR}/token --config ${SUB_DIR}/config.yaml
+ExecStart=/usr/bin/python3 ${SUB_SERVER} --port ${SUB_PORT} --token-file ${SUB_DIR}/token --directory ${SUB_DIR}
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -465,32 +589,84 @@ EOF
   sleep 1
   systemctl is-active --quiet iota-singbox-subscription.service \
     || die "Clash 订阅服务启动失败。"
-  local_content=$(curl -fsS --max-time 5 "http://127.0.0.1:${SUB_PORT}/${token}")
-  grep -q 'IOTA-SINGBOX-REALITY' <<<"$local_content" \
+  local_content=$(curl -fsS --max-time 5 \
+    "http://127.0.0.1:${SUB_PORT}/${token}/clash.yaml")
+  grep -q 'IOTA-REALITY-TCP' <<<"$local_content" \
     || die "Clash 订阅内容本机验证失败。"
-  subscription_url="http://${ip}:${SUB_PORT}/${token}"
-  printf '\nClash Verge/Mihomo订阅链接：\n%s\n' "$subscription_url" >>"$INFO_FILE"
+  base_url="http://${ip}:${SUB_PORT}/${token}"
+  printf '\nClash Verge / Stash订阅：\n%s/clash.yaml\n' "$base_url" >>"$INFO_FILE"
+  printf '\nHiddify订阅（优先尝试）：\n%s/base64.txt\n' "$base_url" >>"$INFO_FILE"
+  printf '\nHiddify单节点链接：\n%s/vless.txt\n' "$base_url" >>"$INFO_FILE"
+  printf '\nsing-box JSON配置：\n%s/singbox.json\n' "$base_url" >>"$INFO_FILE"
   chmod 600 "$INFO_FILE"
-  printf '%s' "$subscription_url"
+  printf '%s' "$base_url"
+}
+
+install_manager() {
+  cat >"$MANAGER" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+readonly VLESS_PORT=${VLESS_PORT}
+readonly SUB_PORT=${SUB_PORT}
+
+case "\${1:-status}" in
+  status)
+    echo "===== 服务状态 ====="
+    systemctl --no-pager --full status sing-box iota-singbox-subscription.service || true
+    echo
+    echo "===== 监听端口 ====="
+    ss -lntp | grep -E ":(\${VLESS_PORT}|\${SUB_PORT})[[:space:]]" || true
+    ;;
+  restart)
+    systemctl restart sing-box iota-singbox-subscription.service
+    sleep 2
+    systemctl is-active sing-box iota-singbox-subscription.service
+    ;;
+  show)
+    cat /root/IOTA_SINGBOX_REALITY_INFO.txt
+    ;;
+  logs)
+    journalctl -u sing-box -n "\${2:-100}" --no-pager
+    ;;
+  follow)
+    journalctl -u sing-box -f
+    ;;
+  check)
+    systemctl is-active --quiet sing-box || { echo "sing-box未运行"; exit 1; }
+    ss -lntH "sport = :\${VLESS_PORT}" | grep -q . || { echo "TCP \${VLESS_PORT}未监听"; exit 1; }
+    echo "sing-box运行正常，TCP \${VLESS_PORT}正在监听。"
+    ;;
+  *)
+    echo "用法：iota-reality {status|restart|show|logs [行数]|follow|check}" >&2
+    exit 2
+    ;;
+esac
+SH
+  chmod 755 "$MANAGER"
 }
 
 finish_install() {
-  local subscription_url=$1
+  local base_url=$1
   printf '%s\n' "$SCRIPT_VERSION" >"$STATE_DIR/complete"
   rm -f "$STATE_DIR/installing"
   chmod 600 "$STATE_DIR/complete"
   printf '\n===== 全部安装与自检成功 =====\n'
   printf 'sing-box状态：active\n'
   printf '协议端口：%s/TCP\n' "$VLESS_PORT"
-  printf 'Clash订阅：%s\n' "$subscription_url"
+  printf '多路复用：已关闭\n'
+  printf 'Clash Verge / Stash订阅：%s/clash.yaml\n' "$base_url"
+  printf 'Hiddify订阅：%s/base64.txt\n' "$base_url"
+  printf 'Hiddify单节点：%s/vless.txt\n' "$base_url"
+  printf 'sing-box JSON：%s/singbox.json\n' "$base_url"
   printf '节点资料：%s\n' "$INFO_FILE"
-  printf '\n请先在 Clash Verge 导入订阅并测试延迟；旧节点先不要删除。\n'
+  printf '\n先在一台 Mac 导入并运行 24 小时；确认稳定后再逐步替换旧节点。\n'
+  printf 'Clash Verge 必须打开 TUN 模式；不要同时运行两个代理客户端。\n'
   printf '如果外部显示 Timeout，请检查 VPS 商家防火墙是否放行 TCP %s 和 %s。\n' \
     "$VLESS_PORT" "$SUB_PORT"
 }
 
 main() {
-  local ip uuid private_key public_key short_id subscription_url
+  local ip uuid private_key public_key short_id base_url
   local -a identity
   require_root
   check_system
@@ -500,7 +676,7 @@ main() {
   prepare_resume
   install_dependencies
   check_ports
-  check_reality_target
+  select_reality_target
   install_sing_box
   systemctl stop sing-box 2>/dev/null || true
   check_ports
@@ -513,11 +689,13 @@ main() {
   short_id=${identity[3]}
   write_server_config "$uuid" "$private_key" "$short_id"
   configure_service
+  configure_tcp_stability
   open_firewall
   self_test_reality "$uuid" "$public_key" "$short_id"
   write_client_files "$ip" "$uuid" "$public_key" "$short_id"
-  subscription_url=$(install_subscription_service "$ip")
-  finish_install "$subscription_url"
+  base_url=$(install_subscription_service "$ip")
+  install_manager
+  finish_install "$base_url"
 }
 
 main "$@"
