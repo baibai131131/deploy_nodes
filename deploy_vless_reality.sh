@@ -7,7 +7,7 @@ set -Eeuo pipefail
 # Production profile for long-running traffic on macOS clients.
 # Design choices: one TCP/443 protocol, no application-layer multiplexing,
 # no scheduled restarts, and no UDP/QUIC dependency for the outer tunnel.
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.1.2"
 readonly SING_BOX_VERSION="1.13.21"
 readonly CONFIG_DIR="/etc/sing-box"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
@@ -89,11 +89,17 @@ refuse_conflicting_proxy() {
     die "检测到其他 sing-box 配置，为避免覆盖已停止安装。"
   fi
   if [[ -f "$STATE_DIR/complete" ]]; then
-    log "本脚本管理的节点已经安装完成。"
-    systemctl is-active --quiet sing-box || die "sing-box 当前未运行。"
-    [[ -s "$INFO_FILE" ]] || die "节点信息文件缺失。"
-    cat "$INFO_FILE"
-    exit 0
+    local installed_version
+    installed_version=$(tr -d '[:space:]' <"$STATE_DIR/complete" 2>/dev/null || true)
+    if [[ $installed_version == "$SCRIPT_VERSION" ]]; then
+      log "本脚本管理的节点已经安装完成。"
+      systemctl is-active --quiet sing-box || die "sing-box 当前未运行。"
+      [[ -s "$INFO_FILE" ]] || die "节点信息文件缺失。"
+      cat "$INFO_FILE"
+      exit 0
+    fi
+    warn "检测到旧版 ${installed_version:-unknown}，将升级到 ${SCRIPT_VERSION} 并重新生成订阅。"
+    rm -f "$STATE_DIR/complete"
   fi
 }
 
@@ -124,8 +130,10 @@ install_dependencies() {
 
 select_reality_target() {
   local target sni result
+  # Microsoft/Akamai may return a non-standard supported_groups extension
+  # in ServerHello, which is rejected by REALITY in current sing-box builds.
   local -a candidates=(
-    "www.microsoft.com|www.microsoft.com"
+    "swdist.apple.com|swdist.apple.com"
     "www.apple.com|www.apple.com"
     "www.cloudflare.com|www.cloudflare.com"
   )
