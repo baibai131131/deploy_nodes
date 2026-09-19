@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # Backup:  Hysteria2 + UDP/443
 # One sing-box process serves both protocols; Clash/Mihomo uses automatic fallback.
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 readonly SING_BOX_VERSION="1.13.21"
 readonly INSTALL_URL="https://sing-box.app/install.sh"
 readonly STATE_DIR="/etc/stable-proxy"
@@ -74,8 +74,10 @@ check_system() {
 }
 
 already_installed() {
-  [[ -f "$STATE_DIR/complete" ]] || return 1
-  [[ $FORCE_REINSTALL == 1 ]] && return 1
+  # This function is called under `set -e`; a fresh installation is a normal
+  # state and must not be reported as a command failure.
+  [[ -f "$STATE_DIR/complete" ]] || return 0
+  [[ $FORCE_REINSTALL == 1 ]] && return 0
   local version
   version=$(tr -d '[:space:]' <"$STATE_DIR/complete" 2>/dev/null || true)
   if [[ $version == "$SCRIPT_VERSION" ]] && \
