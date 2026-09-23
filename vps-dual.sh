@@ -234,7 +234,10 @@ check_reality_target() {
 }
 
 write_config() {
-  cat >"${CONFIG_FILE}.new" <<EOF
+  # Xray detects the configuration format from the final file extension.
+  # Keep `.json` as the suffix while validating the candidate configuration.
+  local candidate_config="${CONFIG_FILE%.json}.new.json"
+  cat >"$candidate_config" <<EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [
@@ -275,8 +278,8 @@ write_config() {
   }
 }
 EOF
-  "$XRAY_BIN" run -test -config "${CONFIG_FILE}.new" || die "Xray 配置校验失败；旧配置未被覆盖"
-  mv -f "${CONFIG_FILE}.new" "$CONFIG_FILE"
+  "$XRAY_BIN" run -test -config "$candidate_config" || die "Xray 配置校验失败；旧配置未被覆盖"
+  mv -f "$candidate_config" "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 }
 
