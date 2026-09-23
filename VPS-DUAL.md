@@ -11,6 +11,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/baibai131131/deploy_nodes/ma
 ```
 
 脚本会同时部署 TCP REALITY 与 Hysteria2，并在完成后输出三条 Clash/Mihomo 订阅链接。安装前请确认 VPS 厂商安全组允许脚本使用的 TCP、UDP 和订阅端口。
+默认 TCP REALITY 目标是 `www.cloudflare.com`；原先使用 `www.microsoft.com` 的 VPS 如需更换目标，运行下方的升级命令。Xray 对 Microsoft 目标的 TLS 证书记录曾出现握手失败，即使 TCP/443 能连通也可能无法使用节点。
+
+已有安装切换目标（复用原 UUID、密钥、HY2 凭据及订阅路径）：
+
+```bash
+REALITY_SNI=www.cloudflare.com bash <(curl -fsSL https://raw.githubusercontent.com/baibai131131/deploy_nodes/main/vps-dual.sh)
+```
+
+安装完成会通过本机临时 Xray 客户端实际连接 TCP REALITY 并访问 HTTPS，成功后才显示部署完成。此项测试需要 VPS 可以访问测试网址；外部无法访问仍须检查厂商安全组是否放行 TCP/443。
 
 ## 结论先说
 
@@ -27,12 +36,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/baibai131131/deploy_nodes/ma
 - XTLS 官方安装器获取 Xray-core，并从 Hysteria 官方下载地址获取 HY2 核心；
 - 安装前配置校验，失败不覆盖现有配置；
 - UUID、密码、REALITY 密钥持久化，重复运行不会无故换节点；
+- 重复安装会重新加载 TCP 服务，确保新的 REALITY 目标立即生效；HY2 服务在普通重装时不会被重启。
 - systemd 自动启动与有限度的服务加固；
 - 自动放行活动的 UFW/firewalld 规则；
 - `show`、`status`、`diagnose`、`restart`、`update`、`uninstall`；
 - HY2 默认使用包含 VPS IP SAN 的自签证书，并在链接中固定证书指纹；也可传入域名正式证书。
 - 生成三份 Clash/Mihomo 订阅：仅 TCP、仅 HY2、自动测速并故障切换。
 - 为兼容 Mihomo REALITY，Xray 默认固定为 `v26.6.27`，不会盲目升级到 Mihomo 文档明确警告的不兼容版本线。
+- Clash 订阅内的本机 `mixed-port` 默认 `7897`，可通过 `CLASH_MIXED_PORT` 调整；这是客户端本地监听端口，不是 VPS 防火墙端口。
 
 ## 使用
 
@@ -90,12 +101,13 @@ sudo ./vps-dual.sh uninstall
 |---|---:|---|
 | `REALITY_PORT` | `443` | TCP REALITY 入口端口 |
 | `HY2_PORT` | `8443` | HY2 UDP 入口端口 |
-| `REALITY_SNI` | `www.microsoft.com` | VPS 本机可直连的 TLS 1.3 伪装目标 |
+| `REALITY_SNI` | `www.cloudflare.com` | VPS 本机可直连的 TLS 1.3 伪装目标；已有安装会保留旧值，传入此变量可修改 |
 | `HY2_SNI` | `SERVER_ADDR` | HY2 证书 SNI；有正式证书时填写你自己的域名 |
 | `SERVER_ADDR` | 自动检测 | 客户端连接 VPS 使用的公网 IP 或域名 |
 | `HY2_CERT_FILE` | 空 | 可选的正式证书链文件 |
 | `HY2_KEY_FILE` | 空 | 可选的正式证书私钥文件 |
 | `SUB_PORT` | `18080` | Clash 订阅服务 TCP 端口 |
+| `CLASH_MIXED_PORT` | `7897` | 订阅配置里的 Clash 本地代理端口 |
 | `SUB_ENABLED` | `1` | `0` 表示不对外提供订阅 URL |
 
 ## 稳定性建议
@@ -115,7 +127,7 @@ sudo ./vps-dual.sh uninstall
 
 你提供的参考脚本同样是“IP + 自签证书 + 指纹固定”，域名只作为可选的证书 CN/SAN。它的多端口是多个独立 Hysteria 实例，并不会自动提高单连接速度；本脚本先保留单端口，减少资源占用和防火墙暴露面。
 
-参考脚本中没有纳入本版本的部分：每天 03:00 清缓存并强制重启、systemd 失败后再用 `nohup` 启动第二份进程、从非官方镜像回退下载二进制，以及通过未加密 HTTP 暴露包含密码的 Clash 订阅。这些行为对速度帮助有限，却会增加固定断线、重复进程、供应链和凭据泄漏风险。
+参考脚本中没有纳入本版本的部分：每天 03:00 清缓存并强制重启、systemd 失败后再用 `nohup` 启动第二份进程、从非官方镜像回退下载二进制。本脚本在没有正式域名证书时仍会使用带随机访问路径的 HTTP 订阅；请妥善保管订阅链接，有正式证书时配置 HTTPS。
 
 ## 安全与恢复
 
