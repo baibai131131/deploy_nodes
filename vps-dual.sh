@@ -100,6 +100,7 @@ save_state() {
     printf 'FIREWALLD_UDP_ADDED=%q\n' "$FIREWALLD_UDP_ADDED"
     printf 'SUB_TOKEN=%q\n' "$SUB_TOKEN"
     printf 'SUB_PORT=%q\n' "$SUB_PORT"
+    printf 'CLASH_MIXED_PORT=%q\n' "$CLASH_MIXED_PORT"
     printf 'SUB_ENABLED=%q\n' "$SUB_ENABLED"
     printf 'SUB_SCHEME=%q\n' "$SUB_SCHEME"
     printf 'SUB_HOST=%q\n' "$SUB_HOST"
@@ -192,6 +193,12 @@ make_keys() {
     pair="$($XRAY_BIN x25519)"
     REALITY_PRIVATE_KEY="$(awk -F': *' '/PrivateKey/{print $2; exit}' <<<"$pair")"
     REALITY_PUBLIC_KEY="$(awk -F': *' '/PublicKey|Password/{print $2; exit}' <<<"$pair")"
+  else
+    local expected_public_key
+    expected_public_key="$($XRAY_BIN x25519 -i "$REALITY_PRIVATE_KEY" | \
+      awk -F': *' '$1 == "Password (PublicKey)" || $1 == "Password" || $1 == "PublicKey" {print $2; exit}')"
+    [[ -n "$expected_public_key" && "$expected_public_key" == "$REALITY_PUBLIC_KEY" ]] || \
+      die "现有 REALITY 密钥对不匹配；已停止安装，避免生成无法连接的节点"
   fi
   [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]] || die "无法生成 REALITY 密钥"
 }
@@ -292,6 +299,68 @@ EOF
   chmod 600 "$CONFIG_FILE"
 }
 
+# Test the actual REALITY handshake against the local TCP listener. A config
+# syntax check or a successful TCP connect does not prove that clients can use it.
+tcp_local_probe() (
+  local work socks_port probe_pid='' code='' url
+  work="$(mktemp -d)"
+  trap 'if [[ -n "$probe_pid" ]]; then kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
+  socks_port="$(python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)"
+
+  python3 - "$work/client.json" "$socks_port" "$REALITY_PORT" "$UUID" \
+    "$REALITY_SNI" "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" <<'PY'
+import json
+import sys
+
+path, socks_port, server_port, uuid, sni, public_key, short_id = sys.argv[1:]
+config = {
+    "log": {"loglevel": "warning"},
+    "inbounds": [{"listen": "127.0.0.1", "port": int(socks_port),
+                  "protocol": "socks", "settings": {"auth": "noauth"}}],
+    "outbounds": [{
+        "protocol": "vless",
+        "settings": {"vnext": [{"address": "127.0.0.1", "port": int(server_port),
+                               "users": [{"id": uuid, "encryption": "none",
+                                          "flow": "xtls-rprx-vision"}]}]},
+        "streamSettings": {
+            "method": "raw", "security": "reality",
+            "realitySettings": {"serverName": sni, "fingerprint": "chrome",
+                                "password": public_key, "shortId": short_id}
+        }
+    }]
+}
+with open(path, "w", encoding="utf-8") as output:
+    json.dump(config, output)
+PY
+  "$XRAY_BIN" run -test -config "$work/client.json" >/dev/null
+  "$XRAY_BIN" run -config "$work/client.json" >"$work/client.log" 2>&1 &
+  probe_pid=$!
+
+  for ((i=0; i<25; i++)); do
+    ss -lnt "( sport = :${socks_port} )" | grep -q 'LISTEN' && break
+    kill -0 "$probe_pid" 2>/dev/null || break
+    sleep 0.2
+  done
+
+  for url in https://www.gstatic.com/generate_204 https://www.cloudflare.com/cdn-cgi/trace; do
+    if code="$(curl --noproxy '' --socks5-hostname "127.0.0.1:${socks_port}" \
+      --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' \
+      "$url" 2>/dev/null)" && [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
+      ok "TCP REALITY 本机握手及 HTTPS 出站测试通过（HTTP ${code}）"
+      return 0
+    fi
+  done
+  warn "TCP REALITY 本机握手/出站测试失败；检查目标域名、密钥和 VPS 出站网络"
+  tail -n 10 "$work/client.log" >&2 || true
+  return 1
+)
+
 write_hy2_config() {
   local sni_guard="strict"
   [[ "$CERT_KIND" == "self-signed" ]] && sni_guard="disable"
@@ -357,8 +426,8 @@ EOF
 }
 
 clash_header() {
-  cat <<'EOF'
-mixed-port: 7890
+  cat <<EOF
+mixed-port: ${CLASH_MIXED_PORT}
 allow-lan: false
 mode: rule
 log-level: info
@@ -496,7 +565,8 @@ PY
 }
 
 write_unit() {
-  local python_bin sub_exec
+  local python_bin sub_exec tcp_was_active=0
+  systemctl is-active --quiet "${APP_NAME}.service" && tcp_was_active=1
   cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=VLESS REALITY and Hysteria2 dual-entry service
@@ -594,6 +664,9 @@ EOF
   fi
   systemctl daemon-reload
   systemctl enable --now "${APP_NAME}.service"
+  if (( tcp_was_active )); then
+    systemctl restart "${APP_NAME}.service"
+  fi
   systemctl enable --now "${APP_NAME}-hy2.service"
   if [[ "$SUB_ENABLED" == 1 ]]; then
     systemctl enable --now "${APP_NAME}-subscriptions.service"
@@ -814,6 +887,7 @@ install_app() {
   local requested_hy2_sni="${HY2_SNI-}"
   local requested_server_addr="${SERVER_ADDR-}"
   local requested_sub_port="${SUB_PORT-}"
+  local requested_clash_mixed_port="${CLASH_MIXED_PORT-}"
   local requested_sub_enabled="${SUB_ENABLED-}"
   load_state
   local old_reality_port="${REALITY_PORT-}"
@@ -822,10 +896,11 @@ install_app() {
 
   REALITY_PORT="${requested_reality_port:-${REALITY_PORT:-443}}"
   HY2_PORT="${requested_hy2_port:-${HY2_PORT:-8443}}"
-  REALITY_SNI="${requested_reality_sni:-${REALITY_SNI:-www.microsoft.com}}"
+  REALITY_SNI="${requested_reality_sni:-${REALITY_SNI:-www.cloudflare.com}}"
   SERVER_ADDR="${requested_server_addr:-${SERVER_ADDR:-$(detect_server_addr)}}"
   HY2_SNI="${requested_hy2_sni:-${HY2_SNI:-$SERVER_ADDR}}"
   SUB_PORT="${requested_sub_port:-${SUB_PORT:-18080}}"
+  CLASH_MIXED_PORT="${requested_clash_mixed_port:-${CLASH_MIXED_PORT:-7897}}"
   SUB_ENABLED="${requested_sub_enabled:-${SUB_ENABLED:-1}}"
   SUB_TOKEN="${SUB_TOKEN:-$(openssl rand -hex 24)}"
   SUB_SCHEME="${SUB_SCHEME:-http}"
@@ -841,6 +916,7 @@ install_app() {
   valid_port "$REALITY_PORT" || die "REALITY_PORT 无效：$REALITY_PORT"
   valid_port "$HY2_PORT" || die "HY2_PORT 无效：$HY2_PORT"
   valid_port "$SUB_PORT" || die "SUB_PORT 无效：$SUB_PORT"
+  valid_port "$CLASH_MIXED_PORT" || die "CLASH_MIXED_PORT 无效：$CLASH_MIXED_PORT"
   [[ "$SUB_ENABLED" == 0 || "$SUB_ENABLED" == 1 ]] || die "SUB_ENABLED 只能是 0 或 1"
   [[ "$REALITY_PORT" != "$HY2_PORT" ]] || warn "TCP 与 UDP 可使用同一个数字端口，但排障时容易混淆"
   valid_name "$REALITY_SNI" || die "REALITY_SNI 格式无效"
@@ -875,6 +951,7 @@ install_app() {
       die "订阅服务未能启动"
     }
   fi
+  tcp_local_probe || die "TCP REALITY 实际连通性测试未通过；未将该节点标记为可用"
   ok "双入口部署完成"
   show_config
 }
@@ -900,10 +977,10 @@ usage() {
 
 首次安装可用环境变量：
   REALITY_PORT=443 HY2_PORT=8443
-  REALITY_SNI=www.microsoft.com HY2_SNI=你的HY2域名或VPS公网IP
+  REALITY_SNI=www.cloudflare.com HY2_SNI=你的HY2域名或VPS公网IP
   SERVER_ADDR=VPS公网IP或域名
   HY2_CERT_FILE=/证书/fullchain.pem HY2_KEY_FILE=/证书/privkey.pem
-  SUB_PORT=18080 SUB_ENABLED=1
+  SUB_PORT=18080 SUB_ENABLED=1 CLASH_MIXED_PORT=7897
 
 示例：
   sudo REALITY_PORT=443 HY2_PORT=8443 bash vps-dual.sh install
