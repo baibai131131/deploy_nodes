@@ -17,13 +17,11 @@ readonly HY2_UNIT_FILE="/etc/systemd/system/${APP_NAME}-hy2.service"
 readonly SUB_DIR="${APP_DIR}/subscriptions"
 readonly SUB_SERVER_FILE="${APP_DIR}/subscription_server.py"
 readonly SUB_UNIT_FILE="/etc/systemd/system/${APP_NAME}-subscriptions.service"
-readonly SYSCTL_FILE="/etc/sysctl.d/99-${APP_NAME}.conf"
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly HYSTERIA_BIN="/usr/local/bin/hysteria"
 readonly OFFICIAL_INSTALLER="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
-readonly HYSTERIA_RELEASE_BASE="https://github.com/HyNetworks/hysteria/releases/download/app"
+readonly HYSTERIA_DOWNLOAD_BASE="https://download.hysteria.network/app/latest"
 readonly DEFAULT_XRAY_VERSION="v26.6.27"
-readonly DEFAULT_HYSTERIA_VERSION="2.12.3"
 
 ACTION="${1:-install}"
 [[ "$ACTION" == --* ]] && ACTION="${ACTION#--}"
@@ -53,7 +51,7 @@ valid_host() {
 
 install_dependencies() {
   local missing=() cmd
-  for cmd in curl unzip openssl ip ss python3 sysctl; do
+  for cmd in curl unzip openssl ip ss python3; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   ((${#missing[@]} == 0)) && return 0
@@ -62,13 +60,13 @@ install_dependencies() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
-    apt-get install -y ca-certificates curl unzip openssl iproute2 python3 procps
+    apt-get install -y ca-certificates curl unzip openssl iproute2 python3
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates curl unzip openssl iproute python3 procps-ng
+    dnf install -y ca-certificates curl unzip openssl iproute python3
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates curl unzip openssl iproute python3 procps-ng
+    yum install -y ca-certificates curl unzip openssl iproute python3
   else
-    die "仅自动支持 apt/dnf/yum；请先安装 curl、unzip、openssl、iproute2、python3、procps"
+    die "仅自动支持 apt/dnf/yum；请先安装 curl、unzip、openssl、iproute2"
   fi
 }
 
@@ -84,9 +82,6 @@ save_state() {
     printf 'UUID=%q\n' "$UUID"
     printf 'HY2_PASSWORD=%q\n' "$HY2_PASSWORD"
     printf 'HY2_OBFS_PASSWORD=%q\n' "$HY2_OBFS_PASSWORD"
-    printf 'HY2_OBFS_MODE=%q\n' "$HY2_OBFS_MODE"
-    printf 'HY2_MASQUERADE_URL=%q\n' "$HY2_MASQUERADE_URL"
-    printf 'HYSTERIA_VERSION=%q\n' "$HYSTERIA_VERSION"
     printf 'HY2_PIN_SHA256=%q\n' "$HY2_PIN_SHA256"
     printf 'HY2_CERT_FINGERPRINT=%q\n' "$HY2_CERT_FINGERPRINT"
     printf 'REALITY_PRIVATE_KEY=%q\n' "$REALITY_PRIVATE_KEY"
@@ -105,18 +100,11 @@ save_state() {
     printf 'FIREWALLD_UDP_ADDED=%q\n' "$FIREWALLD_UDP_ADDED"
     printf 'SUB_TOKEN=%q\n' "$SUB_TOKEN"
     printf 'SUB_PORT=%q\n' "$SUB_PORT"
-    printf 'CLASH_MIXED_PORT=%q\n' "$CLASH_MIXED_PORT"
     printf 'SUB_ENABLED=%q\n' "$SUB_ENABLED"
     printf 'SUB_SCHEME=%q\n' "$SUB_SCHEME"
     printf 'SUB_HOST=%q\n' "$SUB_HOST"
     printf 'SUB_UFW_ADDED=%q\n' "$SUB_UFW_ADDED"
     printf 'SUB_FIREWALLD_ADDED=%q\n' "$SUB_FIREWALLD_ADDED"
-    printf 'ENABLE_BBR=%q\n' "$ENABLE_BBR"
-    printf 'TUNING_MANAGED=%q\n' "$TUNING_MANAGED"
-    printf 'PREV_QDISC=%q\n' "$PREV_QDISC"
-    printf 'PREV_CC=%q\n' "$PREV_CC"
-    printf 'PREV_RMEM=%q\n' "$PREV_RMEM"
-    printf 'PREV_WMEM=%q\n' "$PREV_WMEM"
   } >"${STATE_FILE}.new"
   mv -f "${STATE_FILE}.new" "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -128,80 +116,6 @@ detect_server_addr() {
   [[ -n "$value" ]] || value="$(curl -6fsS --max-time 5 https://api64.ipify.org 2>/dev/null || true)"
   [[ -n "$value" ]] || value="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
   printf '%s' "$value"
-}
-
-configure_network_tuning() {
-  [[ "$ENABLE_BBR" == 1 ]] || {
-    info "已按 ENABLE_BBR=0 跳过内核网络调优；HY2 仍使用自身的拥塞控制"
-    return 0
-  }
-
-  local available current_qdisc current_cc current_rmem current_wmem bbr_available=0
-  available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-  if ! grep -qw bbr <<<"$available"; then
-    command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1 || true
-    available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-  fi
-  grep -qw bbr <<<"$available" && bbr_available=1
-
-  current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-  current_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-  current_rmem="$(sysctl -n net.core.rmem_max 2>/dev/null || true)"
-  current_wmem="$(sysctl -n net.core.wmem_max 2>/dev/null || true)"
-  if [[ "$TUNING_MANAGED" != 1 ]]; then
-    PREV_QDISC="${PREV_QDISC:-$current_qdisc}"
-    PREV_CC="${PREV_CC:-$current_cc}"
-    PREV_RMEM="${PREV_RMEM:-$current_rmem}"
-    PREV_WMEM="${PREV_WMEM:-$current_wmem}"
-  fi
-
-  cat >"${SYSCTL_FILE}.new" <<'EOF'
-# Managed by vps-dual. Hysteria recommends 16 MiB UDP socket buffers.
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-EOF
-  if [[ "$bbr_available" == 1 ]]; then
-    cat >>"${SYSCTL_FILE}.new" <<'EOF'
-# Applies to TCP only; Hysteria2/QUIC has its own BBR controller.
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-  fi
-  mv -f "${SYSCTL_FILE}.new" "$SYSCTL_FILE"
-  if sysctl -p "$SYSCTL_FILE" >/dev/null; then
-    TUNING_MANAGED=1
-    ok "已启用 HY2 16 MiB UDP 缓冲调优"
-    if [[ "$bbr_available" == 1 ]]; then
-      ok "已启用内核原生 TCP BBR + fq（未更换内核）"
-    else
-      warn "当前内核未提供原生 BBR，保持系统原有 TCP 拥塞控制；不会安装旧内核或第三方魔改模块"
-    fi
-  else
-    rm -f "$SYSCTL_FILE"
-    [[ -n "$current_qdisc" ]] && sysctl -w "net.core.default_qdisc=$current_qdisc" >/dev/null 2>&1 || true
-    [[ -n "$current_cc" ]] && sysctl -w "net.ipv4.tcp_congestion_control=$current_cc" >/dev/null 2>&1 || true
-    [[ -n "$current_rmem" ]] && sysctl -w "net.core.rmem_max=$current_rmem" >/dev/null 2>&1 || true
-    [[ -n "$current_wmem" ]] && sysctl -w "net.core.wmem_max=$current_wmem" >/dev/null 2>&1 || true
-    warn "无法应用网络调优，已恢复原有系统设置"
-  fi
-}
-
-restore_network_tuning() {
-  [[ "${TUNING_MANAGED:-0}" == 1 ]] || return 0
-  rm -f "$SYSCTL_FILE"
-  if [[ -n "${PREV_QDISC:-}" ]]; then
-    sysctl -w "net.core.default_qdisc=${PREV_QDISC}" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "${PREV_CC:-}" ]]; then
-    sysctl -w "net.ipv4.tcp_congestion_control=${PREV_CC}" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "${PREV_RMEM:-}" ]]; then
-    sysctl -w "net.core.rmem_max=${PREV_RMEM}" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "${PREV_WMEM:-}" ]]; then
-    sysctl -w "net.core.wmem_max=${PREV_WMEM}" >/dev/null 2>&1 || true
-  fi
-  ok "已移除本脚本的网络调优并尝试恢复原设置"
 }
 
 install_xray() {
@@ -237,18 +151,12 @@ install_xray() {
 }
 
 install_hysteria() {
-  local machine asset tmp hashes release_url expected actual current_version
-  HYSTERIA_VERSION="${HYSTERIA_VERSION:-$DEFAULT_HYSTERIA_VERSION}"
-  [[ "$HYSTERIA_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "HYSTERIA_VERSION 格式无效：$HYSTERIA_VERSION"
   if [[ -x "$HYSTERIA_BIN" && "${FORCE_CORE_UPDATE:-0}" != 1 ]]; then
-    current_version="$($HYSTERIA_BIN version 2>&1 | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed 's/^v//' || true)"
-    if [[ "$current_version" == "$HYSTERIA_VERSION" ]]; then
-      ok "复用已校验版本 Hysteria：v${current_version}"
-      return 0
-    fi
-    warn "现有 Hysteria ${current_version:-未知版本} 与目标 v${HYSTERIA_VERSION} 不同，将安装指定版本"
+    ok "复用现有 Hysteria：$($HYSTERIA_BIN version 2>/dev/null | head -n1 || true)"
+    return 0
   fi
 
+  local machine asset tmp
   machine="$(uname -m)"
   case "$machine" in
     x86_64|amd64) asset="hysteria-linux-amd64" ;;
@@ -261,23 +169,16 @@ install_hysteria() {
     *) die "Hysteria 不支持的架构：$machine" ;;
   esac
   tmp="$(mktemp)"
-  hashes="$(mktemp)"
-  trap 'rm -f "${tmp:-}" "${hashes:-}"' RETURN
-  release_url="${HYSTERIA_RELEASE_BASE}/v${HYSTERIA_VERSION}"
-  info "从 Hysteria 官方发布页获取并校验 ${asset} v${HYSTERIA_VERSION}"
+  trap 'rm -f "${tmp:-}"' RETURN
+  info "从 Hysteria 官方下载地址获取 $asset"
   curl -fL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 120 \
-    "${release_url}/${asset}" -o "$tmp"
-  curl -fL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 \
-    "${release_url}/hashes.txt" -o "$hashes"
-  expected="$(awk -v name="$asset" '{file=$NF; sub(/^\\*/, "", file); if (file==name) {print $1; exit}}' "$hashes")"
-  actual="$(sha256sum "$tmp" | awk '{print $1}')"
-  [[ -n "$expected" && "$actual" == "$expected" ]] || die "Hysteria SHA256 校验失败"
+    "${HYSTERIA_DOWNLOAD_BASE}/${asset}" -o "$tmp"
   chmod 755 "$tmp"
   "$tmp" version >/dev/null 2>&1 || "$tmp" --version >/dev/null 2>&1 || die "Hysteria 二进制校验失败"
   install -m 755 "$tmp" "$HYSTERIA_BIN"
   trap - RETURN
-  rm -f "$tmp" "$hashes"
-  ok "已安装并校验 Hysteria：$($HYSTERIA_BIN version 2>&1 | head -n1 || true)"
+  rm -f "$tmp"
+  ok "已安装 Hysteria：$($HYSTERIA_BIN version 2>/dev/null | head -n1 || true)"
 }
 
 make_keys() {
@@ -291,12 +192,6 @@ make_keys() {
     pair="$($XRAY_BIN x25519)"
     REALITY_PRIVATE_KEY="$(awk -F': *' '/PrivateKey/{print $2; exit}' <<<"$pair")"
     REALITY_PUBLIC_KEY="$(awk -F': *' '/PublicKey|Password/{print $2; exit}' <<<"$pair")"
-  else
-    local expected_public_key
-    expected_public_key="$($XRAY_BIN x25519 -i "$REALITY_PRIVATE_KEY" | \
-      awk -F': *' '$1 == "Password (PublicKey)" || $1 == "Password" || $1 == "PublicKey" {print $2; exit}')"
-    [[ -n "$expected_public_key" && "$expected_public_key" == "$REALITY_PUBLIC_KEY" ]] || \
-      die "现有 REALITY 密钥对不匹配；已停止安装，避免生成无法连接的节点"
   fi
   [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]] || die "无法生成 REALITY 密钥"
 }
@@ -324,8 +219,10 @@ make_certificate() {
   if [[ "$CERT_KIND" == "self-signed" ]]; then
     chmod 600 "$CERT_DIR/server.crt" "$CERT_DIR/server.key"
   fi
+  HY2_PIN_SHA256="$(openssl x509 -pubkey -in "$CERT_DIR/server.crt" 2>/dev/null | \
+    openssl pkey -pubin -outform DER 2>/dev/null | \
+    openssl dgst -sha256 -binary 2>/dev/null | base64 | tr -d '\r\n')"
   HY2_CERT_FINGERPRINT="$(openssl x509 -noout -fingerprint -sha256 -in "$CERT_DIR/server.crt" | cut -d= -f2)"
-  HY2_PIN_SHA256="$HY2_CERT_FINGERPRINT"
   [[ -n "$HY2_PIN_SHA256" ]] || die "无法计算 HY2 证书指纹"
   [[ -n "$HY2_CERT_FINGERPRINT" ]] || die "无法计算 Mihomo 证书指纹"
 }
@@ -360,7 +257,9 @@ write_config() {
           "target": "${REALITY_SNI}:443",
           "serverNames": ["${REALITY_SNI}"],
           "privateKey": "${REALITY_PRIVATE_KEY}",
-          "shortIds": ["${REALITY_SHORT_ID}"]
+          "shortIds": ["${REALITY_SHORT_ID}"],
+          "limitFallbackUpload": {"afterBytes": 0, "bytesPerSec": 65536, "burstBytesPerSec": 131072},
+          "limitFallbackDownload": {"afterBytes": 0, "bytesPerSec": 262144, "burstBytesPerSec": 524288}
         }
       },
       "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false}
@@ -393,73 +292,10 @@ EOF
   chmod 600 "$CONFIG_FILE"
 }
 
-# A successful syntax check or TCP connect does not prove that a REALITY client
-# can complete its handshake. Test the actual local listener before reporting success.
-tcp_local_probe() (
-  local work socks_port probe_pid='' code='' url
-  work="$(mktemp -d)"
-  trap 'if [[ -n "$probe_pid" ]]; then kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
-  socks_port="$(python3 - <<'PY'
-import socket
-with socket.socket() as sock:
-    sock.bind(("127.0.0.1", 0))
-    print(sock.getsockname()[1])
-PY
-)"
-
-  python3 - "$work/client.json" "$socks_port" "$REALITY_PORT" "$UUID" \
-    "$REALITY_SNI" "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" <<'PY'
-import json
-import sys
-
-path, socks_port, server_port, uuid, sni, public_key, short_id = sys.argv[1:]
-config = {
-    "log": {"loglevel": "warning"},
-    "inbounds": [{"listen": "127.0.0.1", "port": int(socks_port),
-                  "protocol": "socks", "settings": {"auth": "noauth"}}],
-    "outbounds": [{
-        "protocol": "vless",
-        "settings": {"vnext": [{"address": "127.0.0.1", "port": int(server_port),
-                               "users": [{"id": uuid, "encryption": "none",
-                                          "flow": "xtls-rprx-vision"}]}]},
-        "streamSettings": {
-            "method": "raw", "security": "reality",
-            "realitySettings": {"serverName": sni, "fingerprint": "chrome",
-                                "password": public_key, "shortId": short_id}
-        }
-    }]
-}
-with open(path, "w", encoding="utf-8") as output:
-    json.dump(config, output)
-PY
-  "$XRAY_BIN" run -test -config "$work/client.json" >/dev/null
-  "$XRAY_BIN" run -config "$work/client.json" >"$work/client.log" 2>&1 &
-  probe_pid=$!
-
-  for ((i=0; i<25; i++)); do
-    ss -lnt "( sport = :${socks_port} )" | grep -q 'LISTEN' && break
-    kill -0 "$probe_pid" 2>/dev/null || break
-    sleep 0.2
-  done
-
-  for url in https://www.gstatic.com/generate_204 https://www.cloudflare.com/cdn-cgi/trace; do
-    if code="$(curl --noproxy '' --socks5-hostname "127.0.0.1:${socks_port}" \
-      --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' \
-      "$url" 2>/dev/null)" && [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
-      ok "TCP REALITY 本机握手及 HTTPS 出站测试通过（HTTP ${code}）"
-      return 0
-    fi
-  done
-  warn "TCP REALITY 本机握手/出站测试失败；检查目标域名、密钥和 VPS 出站网络"
-  tail -n 10 "$work/client.log" >&2 || true
-  return 1
-)
-
 write_hy2_config() {
   local sni_guard="strict"
   [[ "$CERT_KIND" == "self-signed" ]] && sni_guard="disable"
-  {
-    cat <<EOF
+  cat >"${HY2_CONFIG_FILE}.new" <<EOF
 listen: :${HY2_PORT}
 tls:
   cert: ${CERT_DIR}/server.crt
@@ -468,33 +304,15 @@ tls:
 auth:
   type: password
   password: ${HY2_PASSWORD}
-EOF
-    if [[ "$HY2_OBFS_MODE" == "salamander" ]]; then
-      cat <<EOF
 obfs:
   type: salamander
   salamander:
     password: ${HY2_OBFS_PASSWORD}
-EOF
-    fi
-    cat <<EOF
 congestion:
   type: bbr
   bbrProfile: standard
 udpIdleTimeout: 60s
 EOF
-    if [[ "$HY2_OBFS_MODE" == "none" ]]; then
-      cat <<EOF
-masquerade:
-  type: proxy
-  proxy:
-    url: ${HY2_MASQUERADE_URL}
-    rewriteHost: true
-    insecure: false
-    xForwarded: false
-EOF
-    fi
-  } >"${HY2_CONFIG_FILE}.new"
   mv -f "${HY2_CONFIG_FILE}.new" "$HY2_CONFIG_FILE"
   chmod 600 "$HY2_CONFIG_FILE"
 }
@@ -526,23 +344,21 @@ clash_hy2_proxy() {
     server: "${SERVER_ADDR}"
     port: ${HY2_PORT}
     password: "${HY2_PASSWORD}"
+    obfs: salamander
+    obfs-password: "${HY2_OBFS_PASSWORD}"
     sni: "${HY2_SNI}"
     skip-cert-verify: false
     alpn:
       - h3
 EOF
-  if [[ "$HY2_OBFS_MODE" == "salamander" ]]; then
-    printf '    obfs: salamander\n'
-    printf '    obfs-password: "%s"\n' "$HY2_OBFS_PASSWORD"
-  fi
   if [[ "$CERT_KIND" == "self-signed" ]]; then
     printf '    fingerprint: "%s"\n' "$HY2_CERT_FINGERPRINT"
   fi
 }
 
 clash_header() {
-  cat <<EOF
-mixed-port: ${CLASH_MIXED_PORT}
+  cat <<'EOF'
+mixed-port: 7890
 allow-lan: false
 mode: rule
 log-level: info
@@ -680,10 +496,7 @@ PY
 }
 
 write_unit() {
-  local python_bin sub_exec tcp_was_active=0 hy2_was_active=0 sub_was_active=0
-  systemctl is-active --quiet "${APP_NAME}.service" && tcp_was_active=1
-  systemctl is-active --quiet "${APP_NAME}-hy2.service" && hy2_was_active=1
-  systemctl is-active --quiet "${APP_NAME}-subscriptions.service" && sub_was_active=1
+  local python_bin sub_exec
   cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=VLESS REALITY and Hysteria2 dual-entry service
@@ -698,8 +511,6 @@ ExecStart=${XRAY_BIN} run -config ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
@@ -728,10 +539,7 @@ User=root
 ExecStart=${HYSTERIA_BIN} server -c ${HY2_CONFIG_FILE}
 Restart=on-failure
 RestartSec=3s
-Nice=-5
 LimitNOFILE=1048576
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
@@ -786,12 +594,9 @@ EOF
   fi
   systemctl daemon-reload
   systemctl enable --now "${APP_NAME}.service"
-  (( tcp_was_active )) && systemctl restart "${APP_NAME}.service"
   systemctl enable --now "${APP_NAME}-hy2.service"
-  (( hy2_was_active )) && systemctl restart "${APP_NAME}-hy2.service"
   if [[ "$SUB_ENABLED" == 1 ]]; then
     systemctl enable --now "${APP_NAME}-subscriptions.service"
-    (( sub_was_active )) && systemctl restart "${APP_NAME}-subscriptions.service"
   fi
 }
 
@@ -857,24 +662,20 @@ uri_encode() {
 }
 
 write_shares() {
-  local host insecure pin_arg sub_url_host obfs_arg
+  local host insecure pin_arg sub_url_host
   host="$(uri_host)"
   insecure=0
   pin_arg=""
-  obfs_arg=""
   if [[ "$CERT_KIND" == "self-signed" ]]; then
     insecure=1
     pin_arg="&pinSHA256=$(uri_encode "$HY2_PIN_SHA256")"
-  fi
-  if [[ "$HY2_OBFS_MODE" == "salamander" ]]; then
-    obfs_arg="&obfs=salamander&obfs-password=$(uri_encode "$HY2_OBFS_PASSWORD")"
   fi
   cat >"$SHARE_FILE" <<EOF
 VLESS-TCP-REALITY（主用）
 vless://${UUID}@${host}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#VPS-TCP-REALITY
 
 Hysteria2（网络支持 UDP 时备用/加速）
-hysteria2://${HY2_PASSWORD}@${host}:${HY2_PORT}/?sni=${HY2_SNI}&insecure=${insecure}${obfs_arg}${pin_arg}#VPS-HY2
+hysteria2://${HY2_PASSWORD}@${host}:${HY2_PORT}/?obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}&sni=${HY2_SNI}&insecure=${insecure}${pin_arg}#VPS-HY2
 EOF
   if [[ "$SUB_ENABLED" == 1 ]]; then
     sub_url_host="$SUB_HOST"
@@ -901,10 +702,7 @@ show_config() {
     printf '订阅服务：'; systemctl is-active "${APP_NAME}-subscriptions.service" || true
   fi
   printf 'REALITY：TCP/%s，SNI=%s\n' "$REALITY_PORT" "$REALITY_SNI"
-  printf 'HY2：UDP/%s，SNI=%s，证书=%s，混淆=%s\n' "$HY2_PORT" "$HY2_SNI" "$CERT_KIND" "$HY2_OBFS_MODE"
-  printf 'TCP 拥塞控制：%s；队列：%s\n' \
-    "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)" \
-    "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+  printf 'HY2：UDP/%s，SNI=%s，证书=%s\n' "$HY2_PORT" "$HY2_SNI" "$CERT_KIND"
 }
 
 diagnose() {
@@ -926,7 +724,6 @@ diagnose() {
   fi
   ip -s link || true
   echo "== active TCP congestion/retransmission =="
-  sysctl net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true
   ss -tin state established || true
   if command -v ping >/dev/null 2>&1; then
     echo "== short outbound loss sample (not the client path) =="
@@ -999,7 +796,6 @@ uninstall_app() {
   systemctl disable --now "${APP_NAME}-hy2.service" >/dev/null 2>&1 || true
   systemctl disable --now "${APP_NAME}-subscriptions.service" >/dev/null 2>&1 || true
   [[ -n "${REALITY_PORT:-}" && -n "${HY2_PORT:-}" ]] && remove_firewall
-  restore_network_tuning
   rm -f "$UNIT_FILE"
   rm -f "$HY2_UNIT_FILE"
   rm -f "$SUB_UNIT_FILE"
@@ -1012,36 +808,25 @@ install_app() {
   require_root
   install_dependencies
   mkdir -p "$APP_DIR"
-  local https_url_re='^https://[A-Za-z0-9._:/?&=%+-]+$'
   local requested_reality_port="${REALITY_PORT-}"
   local requested_hy2_port="${HY2_PORT-}"
   local requested_reality_sni="${REALITY_SNI-}"
   local requested_hy2_sni="${HY2_SNI-}"
-  local requested_hy2_obfs_mode="${HY2_OBFS_MODE-}"
-  local requested_hy2_masquerade_url="${HY2_MASQUERADE_URL-}"
-  local requested_hysteria_version="${HYSTERIA_VERSION-}"
   local requested_server_addr="${SERVER_ADDR-}"
   local requested_sub_port="${SUB_PORT-}"
-  local requested_clash_mixed_port="${CLASH_MIXED_PORT-}"
   local requested_sub_enabled="${SUB_ENABLED-}"
-  local requested_enable_bbr="${ENABLE_BBR-}"
   load_state
   local old_reality_port="${REALITY_PORT-}"
   local old_hy2_port="${HY2_PORT-}"
   local old_sub_port="${SUB_PORT-}"
 
   REALITY_PORT="${requested_reality_port:-${REALITY_PORT:-443}}"
-  HY2_PORT="${requested_hy2_port:-${HY2_PORT:-443}}"
-  REALITY_SNI="${requested_reality_sni:-${REALITY_SNI:-www.cloudflare.com}}"
+  HY2_PORT="${requested_hy2_port:-${HY2_PORT:-8443}}"
+  REALITY_SNI="${requested_reality_sni:-${REALITY_SNI:-www.microsoft.com}}"
   SERVER_ADDR="${requested_server_addr:-${SERVER_ADDR:-$(detect_server_addr)}}"
   HY2_SNI="${requested_hy2_sni:-${HY2_SNI:-$SERVER_ADDR}}"
-  HY2_OBFS_MODE="${requested_hy2_obfs_mode:-${HY2_OBFS_MODE:-none}}"
-  HY2_MASQUERADE_URL="${requested_hy2_masquerade_url:-${HY2_MASQUERADE_URL:-https://www.microsoft.com/}}"
-  HYSTERIA_VERSION="${requested_hysteria_version:-${HYSTERIA_VERSION:-$DEFAULT_HYSTERIA_VERSION}}"
   SUB_PORT="${requested_sub_port:-${SUB_PORT:-18080}}"
-  CLASH_MIXED_PORT="${requested_clash_mixed_port:-${CLASH_MIXED_PORT:-7897}}"
   SUB_ENABLED="${requested_sub_enabled:-${SUB_ENABLED:-1}}"
-  ENABLE_BBR="${requested_enable_bbr:-${ENABLE_BBR:-1}}"
   SUB_TOKEN="${SUB_TOKEN:-$(openssl rand -hex 24)}"
   SUB_SCHEME="${SUB_SCHEME:-http}"
   SUB_HOST="${SUB_HOST:-$SERVER_ADDR}"
@@ -1052,21 +837,12 @@ install_app() {
   FIREWALLD_UDP_ADDED="${FIREWALLD_UDP_ADDED:-0}"
   SUB_UFW_ADDED="${SUB_UFW_ADDED:-0}"
   SUB_FIREWALLD_ADDED="${SUB_FIREWALLD_ADDED:-0}"
-  TUNING_MANAGED="${TUNING_MANAGED:-0}"
-  PREV_QDISC="${PREV_QDISC:-}"
-  PREV_CC="${PREV_CC:-}"
-  PREV_RMEM="${PREV_RMEM:-}"
-  PREV_WMEM="${PREV_WMEM:-}"
 
   valid_port "$REALITY_PORT" || die "REALITY_PORT 无效：$REALITY_PORT"
   valid_port "$HY2_PORT" || die "HY2_PORT 无效：$HY2_PORT"
   valid_port "$SUB_PORT" || die "SUB_PORT 无效：$SUB_PORT"
-  valid_port "$CLASH_MIXED_PORT" || die "CLASH_MIXED_PORT 无效：$CLASH_MIXED_PORT"
   [[ "$SUB_ENABLED" == 0 || "$SUB_ENABLED" == 1 ]] || die "SUB_ENABLED 只能是 0 或 1"
-  [[ "$ENABLE_BBR" == 0 || "$ENABLE_BBR" == 1 ]] || die "ENABLE_BBR 只能是 0 或 1"
-  [[ "$HY2_OBFS_MODE" == "salamander" || "$HY2_OBFS_MODE" == "none" ]] || die "HY2_OBFS_MODE 只能是 salamander 或 none"
-  [[ "$HY2_MASQUERADE_URL" =~ $https_url_re ]] || die "HY2_MASQUERADE_URL 必须是合法的 HTTPS URL"
-  [[ "$REALITY_PORT" != "$HY2_PORT" ]] || info "TCP 与 UDP 共用数字端口 ${REALITY_PORT}（协议不同，不冲突）"
+  [[ "$REALITY_PORT" != "$HY2_PORT" ]] || warn "TCP 与 UDP 可使用同一个数字端口，但排障时容易混淆"
   valid_name "$REALITY_SNI" || die "REALITY_SNI 格式无效"
   valid_host "$HY2_SNI" || die "HY2_SNI 格式无效"
   [[ -n "$SERVER_ADDR" ]] || die "无法检测公网地址，请设置 SERVER_ADDR=你的IP或域名"
@@ -1083,7 +859,6 @@ install_app() {
   write_unit
   open_firewall
   write_shares
-  configure_network_tuning
   save_state
 
   systemctl is-active --quiet "${APP_NAME}.service" || {
@@ -1100,7 +875,6 @@ install_app() {
       die "订阅服务未能启动"
     }
   fi
-  tcp_local_probe || die "TCP REALITY 实际连通性测试未通过；未将该节点标记为可用"
   ok "双入口部署完成"
   show_config
 }
@@ -1117,7 +891,7 @@ update_core() {
   systemctl restart "${APP_NAME}.service"
   systemctl restart "${APP_NAME}-hy2.service"
   [[ "${SUB_ENABLED:-0}" == 1 ]] && systemctl restart "${APP_NAME}-subscriptions.service"
-  ok "核心升级并重启完成：$($XRAY_BIN version | head -n1)；$($HYSTERIA_BIN version 2>&1 | head -n1 || true)"
+  ok "核心升级并重启完成：$($XRAY_BIN version | head -n1)；$($HYSTERIA_BIN version 2>/dev/null | head -n1 || true)"
 }
 
 usage() {
@@ -1125,16 +899,14 @@ usage() {
 用法：sudo bash vps-dual.sh [install|show|status|diagnose|restart|update|uninstall]
 
 首次安装可用环境变量：
-  REALITY_PORT=443 HY2_PORT=443
-  REALITY_SNI=www.cloudflare.com HY2_SNI=你的HY2域名或VPS公网IP
+  REALITY_PORT=443 HY2_PORT=8443
+  REALITY_SNI=www.microsoft.com HY2_SNI=你的HY2域名或VPS公网IP
   SERVER_ADDR=VPS公网IP或域名
   HY2_CERT_FILE=/证书/fullchain.pem HY2_KEY_FILE=/证书/privkey.pem
-  HY2_OBFS_MODE=none HY2_MASQUERADE_URL=https://www.microsoft.com/
-  ENABLE_BBR=1
-  SUB_PORT=18080 SUB_ENABLED=1 CLASH_MIXED_PORT=7897
+  SUB_PORT=18080 SUB_ENABLED=1
 
 示例：
-  sudo REALITY_PORT=443 HY2_PORT=443 bash vps-dual.sh install
+  sudo REALITY_PORT=443 HY2_PORT=8443 bash vps-dual.sh install
 EOF
 }
 
@@ -1149,4 +921,3 @@ case "$ACTION" in
   help|-h)   usage ;;
   *)         usage; exit 2 ;;
 esac
-
