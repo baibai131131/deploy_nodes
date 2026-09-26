@@ -33,6 +33,13 @@ ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
+on_error() {
+  local rc=$? line="${BASH_LINENO[0]:-未知}"
+  printf '\033[1;31m[FAIL]\033[0m 脚本在第 %s 行异常退出（状态码 %s）\n' "$line" "$rc" >&2
+  exit "$rc"
+}
+trap on_error ERR
+
 require_root() {
   [[ "${EUID}" -eq 0 ]] || die "请使用 root 运行：sudo bash $0 $ACTION"
 }
@@ -786,13 +793,20 @@ EOF
   fi
   systemctl daemon-reload
   systemctl enable --now "${APP_NAME}.service"
-  (( tcp_was_active )) && systemctl restart "${APP_NAME}.service"
+  if (( tcp_was_active )); then
+    systemctl restart "${APP_NAME}.service"
+  fi
   systemctl enable --now "${APP_NAME}-hy2.service"
-  (( hy2_was_active )) && systemctl restart "${APP_NAME}-hy2.service"
+  if (( hy2_was_active )); then
+    systemctl restart "${APP_NAME}-hy2.service"
+  fi
   if [[ "$SUB_ENABLED" == 1 ]]; then
     systemctl enable --now "${APP_NAME}-subscriptions.service"
-    (( sub_was_active )) && systemctl restart "${APP_NAME}-subscriptions.service"
+    if (( sub_was_active )); then
+      systemctl restart "${APP_NAME}-subscriptions.service"
+    fi
   fi
+  return 0
 }
 
 open_firewall() {
