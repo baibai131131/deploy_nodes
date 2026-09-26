@@ -269,7 +269,7 @@ install_hysteria() {
     "${release_url}/${asset}" -o "$tmp"
   curl -fL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 \
     "${release_url}/hashes.txt" -o "$hashes"
-  expected="$(awk -v name="$asset" '{file=$NF; sub(/^\\*/, "", file); if (file==name) {print $1; exit}}' "$hashes")"
+  expected="$(awk -v name="$asset" '{file=$NF; sub(/^\*/, "", file); sub(/^.*\//, "", file); if (file==name) {print $1; exit}}' "$hashes")"
   actual="$(sha256sum "$tmp" | awk '{print $1}')"
   [[ -n "$expected" && "$actual" == "$expected" ]] || die "Hysteria SHA256 校验失败"
   chmod 755 "$tmp"
