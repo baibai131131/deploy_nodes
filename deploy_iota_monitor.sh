@@ -3,29 +3,30 @@ set -euo pipefail
 setopt null_glob
 umask 077
 
-# IOTA Guardian V6.3：精准状态、注册诊断、Run 查询与本机实时仪表盘。
+# IOTA Guardian V6.4：精准状态、官方 Run 池容量、参与 Run 统计与本机实时仪表盘。
 [[ "$(uname -s)" == Darwin ]] || { echo "本脚本仅支持 macOS。"; exit 1; }
 [[ "$(id -u)" != 0 ]] || { echo "请使用当前登录用户运行，不要使用 sudo。"; exit 1; }
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.3.3"
+VERSION="6.4.0"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
 CLEAN_LABEL="com.baibai.iota-guardian-v6.cleanup"
 REPORT_LABEL="com.baibai.iota-guardian-v6.report"
+POOL_LABEL="com.baibai.iota-guardian-v6.run-pool"
 mkdir -p "$BASE" "$LAUNCH" "$BASE/reports" "$BASE/backups"
 BACKUP=$(mktemp -d "$BASE/backups/before-v6-XXXXXXXX")
 STAGE=$(mktemp -d "$BASE/install-stage-XXXXXXXX")
 mkdir -p "$BACKUP/files" "$BACKUP/LaunchAgents"
-for item in node_name push_url version monitor.sh status_engine.py dashboard.py runs_view.py show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state current_record.tsv queue_start_epoch low_p2p_count; do
+for item in node_name push_url version monitor.sh status_engine.py dashboard.py runs_view.py run_tracker.py runs_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state current_record.tsv queue_start_epoch low_p2p_count run_history.tsv run_pool_summary.tsv run_pool_display.txt; do
   [[ ! -f "$BASE/$item" ]] || cp -p "$BASE/$item" "$BACKUP/files/$item"
 done
 trap 'echo "安装未完成。备份：$BACKUP；请保留此目录，勿上传（含 Push URL）。" >&2' ZERR
 
 echo "=============================================="
-echo " IOTA Guardian V6.3 本机仪表盘版"
+echo " IOTA Guardian V6.4 Run统计增强版"
 echo "=============================================="
 echo "只监控、记录、告警和清理旧日志，不控制或重启 IOTA。"
 echo
@@ -275,12 +276,37 @@ def parse(log):
     values += ["-"] * (13 - len(values))
     return values[:13]
 
+def run_stats():
+    history = BASE / "run_history.tsv"
+    today = datetime.now().strftime("%Y-%m-%d")
+    rows = {}
+    try:
+        for line in history.read_text(errors="replace").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                rows[parts[0]] = parts
+    except Exception:
+        pass
+    return sum(1 for parts in rows.values() if parts[2].startswith(today)), len(rows)
+
+def pool_stats(now):
+    cache = BASE / "run_pool_summary.tsv"
+    try:
+        values = cache.read_text(errors="replace").strip().split("\t")
+        values += ["-"] * (7 - len(values))
+        age = max(0, now - int(values[0]))
+        return values[1], values[2], values[3], values[4], values[5], values[6], age
+    except Exception:
+        return "-", "-", "-", "-", "-", "-", 999999
+
 def render():
     node = (BASE / "node_name").read_text(errors="ignore").strip() if (BASE / "node_name").exists() else os.uname().nodename
     version = (BASE / "version").read_text(errors="ignore").strip() if (BASE / "version").exists() else "未知"
     log = latest_log()
     running, cpu, mem = process_stats()
     now = int(time.time())
+    run_today, run_total = run_stats()
+    pool_active, pool_total, pool_used, pool_cap, pool_free, pool_default, pool_age = pool_stats(now)
 
     if not log:
         fields = ["NO_LOG"] + ["-"] * 12
@@ -320,6 +346,13 @@ def render():
             if total and ok * 100 < total * 25: warning = "  ⚠️ 偏低"
         except Exception: pass
         lines.append(f"P2P：             {p2p}{warning}")
+    lines.append(f"本机Run统计：     今日 {run_today} 个 | 累计 {run_total} 个")
+    if pool_active != "-":
+        pool_line = f"官方Run池：       活跃 {pool_active} 个"
+        if pool_used != "-" and pool_cap != "-": pool_line += f" | 已用 {pool_used}/{pool_cap}"
+        if pool_free != "-": pool_line += f" | 空位 {pool_free}"
+        if pool_age > 1800: pool_line += "  ⚠️ 数据超过30分钟"
+        lines.append(pool_line)
     lines += [
         f"最近有效计算：    {duration(activity_age)}" if activity_age != "-" else "最近有效计算：    暂无",
         f"判断依据：        {detail if detail != '-' else '暂无'}",
@@ -336,7 +369,7 @@ def render():
         f"磁盘可用：        {free:.1f} GB",
         "",
         f"每{REFRESH}秒刷新 | Ctrl+C 仅关闭此窗口，不会停止 IOTA",
-        "全部Run池：~/.iota-guardian/show_runs.sh",
+        "全部Run池：      ~/.iota-guardian/show_runs.sh",
         "==============================================",
     ]
     sys.stdout.write("\033[2J\033[H" + "\n".join(lines) + "\n")
@@ -361,8 +394,8 @@ DASH
 
 cat > "$STAGE/runs_view.py" <<'PY'
 #!/usr/bin/python3
-"""Read the public Macrocosmos Run APIs on demand; never changes local IOTA state."""
-import json, re, sys
+"""Read public Macrocosmos Run APIs; never changes local IOTA state."""
+import gzip, json, re, sys, time
 from urllib.request import Request, urlopen
 
 URLS = (
@@ -372,9 +405,12 @@ URLS = (
 RUN_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(?:-[A-Za-z0-9_-]+)?$")
 
 def fetch(url):
-    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.3", "Accept": "application/json"})
+    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.4", "Accept": "application/json"})
     with urlopen(req, timeout=12) as res:
-        return json.load(res)
+        body = res.read()
+        if res.headers.get("Content-Encoding", "").lower() == "gzip" or body[:2] == b"\x1f\x8b":
+            body = gzip.decompress(body)
+        return json.loads(body.decode("utf-8"))
 
 def walk(value):
     if isinstance(value, dict):
@@ -399,49 +435,174 @@ def first_number(obj, keys):
             return int(value)
     return None
 
+def list_value(values, index):
+    if isinstance(values, list) and index < len(values):
+        value = values[index]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+runs_data = occupancy_data = {}
+errors = []
 try:
     runs_data = fetch(URLS[0])
 except Exception as exc:
-    print("官方 Run 接口暂时无法访问：" + str(exc))
+    errors.append("runs: " + str(exc))
+try:
+    occupancy_data = fetch(URLS[1])
+except Exception as exc:
+    errors.append("occupancy: " + str(exc))
+if not runs_data and not occupancy_data:
+    print("官方 Run 接口暂时无法访问：" + "; ".join(errors))
     print("这只影响池子查询，不影响本机监控和 IOTA 训练。")
     raise SystemExit(1)
 
-try:
-    occupancy_data = fetch(URLS[1])
-except Exception:
-    occupancy_data = {}
-
 runs = {}
-for obj in walk(runs_data):
-    rid = run_id(obj)
-    if rid:
-        runs.setdefault(rid, {}).update(obj)
-for obj in walk(occupancy_data):
-    rid = run_id(obj)
-    if rid:
-        runs.setdefault(rid, {}).update(obj)
+source_runs = runs_data.get("runs", []) if isinstance(runs_data, dict) else []
+if isinstance(source_runs, list):
+    for obj in source_runs:
+        if not isinstance(obj, dict):
+            continue
+        rid = run_id(obj)
+        if rid:
+            runs.setdefault(rid, {}).update(obj)
+if not runs:
+    for obj in walk(runs_data):
+        rid = run_id(obj)
+        if rid:
+            runs.setdefault(rid, {}).update(obj)
+
+# Current occupancy endpoint returns parallel arrays. Keep the older object
+# parser as a fallback in case Macrocosmos changes the schema again.
+columnar = False
+if isinstance(occupancy_data, dict) and isinstance(occupancy_data.get("run_ids"), list):
+    columnar = True
+    for index, rid in enumerate(occupancy_data["run_ids"]):
+        if not isinstance(rid, str) or not RUN_RE.match(rid):
+            continue
+        obj = runs.setdefault(rid, {})
+        for source, target in (("max_miners", "max_miners"),
+                               ("active_miners", "active_miners"),
+                               ("slots_remaining", "slots_remaining")):
+            value = list_value(occupancy_data.get(source), index)
+            if value is not None:
+                obj[target] = value
+if not columnar:
+    for obj in walk(occupancy_data):
+        rid = run_id(obj)
+        if rid:
+            runs.setdefault(rid, {}).update(obj)
 
 def key(rid):
     return tuple(int(x) for x in re.findall(r"\d+", rid)[:4])
 
-print("===== Macrocosmos IOTA 当前 Run 池 =====")
 if not runs:
     print("接口已响应，但没有识别到 Run；项目方可能调整了接口格式。")
     raise SystemExit(2)
-for rid in sorted(runs, key=key, reverse=True):
+
+active_ids = [rid for rid, obj in runs.items()
+              if str(obj.get("state") or obj.get("status") or "active").lower() == "active"]
+visible_ids = active_ids or list(runs)
+used_total = cap_total = slots_total = 0
+used_known = cap_known = slots_known = False
+for rid in visible_ids:
     obj = runs[rid]
     used = first_number(obj, ("active_miners", "current_miners", "miners", "occupied", "occupancy", "current"))
     cap = first_number(obj, ("max_miners", "capacity", "total_slots", "max_nodes", "total"))
-    status = obj.get("status") or ("active" if obj.get("active") is True or obj.get("is_active") is True else "")
+    slots = first_number(obj, ("slots_remaining", "remaining", "available_slots", "free_slots"))
+    if used is not None:
+        used_total += used; used_known = True
+    if cap is not None and cap > 0:
+        cap_total += cap; cap_known = True
+    if slots is not None:
+        slots_total += slots; slots_known = True
+    elif used is not None and cap is not None and cap > 0:
+        slots_total += max(0, cap - used); slots_known = True
+
+default_id = next((rid for rid in visible_ids if runs[rid].get("is_default") is True), "-")
+if "--summary-tsv" in sys.argv:
+    print("\t".join((str(int(time.time())), str(len(visible_ids)), str(len(runs)),
+                      str(used_total) if used_known else "-",
+                      str(cap_total) if cap_known else "-",
+                      str(slots_total) if slots_known else "-", default_id)))
+    raise SystemExit
+
+print("===== Macrocosmos IOTA 当前 Run 池 =====")
+summary = f"活跃 {len(visible_ids)} 个"
+if used_known and cap_known:
+    summary += f" | 已用 {used_total}/{cap_total}"
+if slots_known:
+    summary += f" | 空位 {slots_total}"
+print(summary)
+for rid in sorted(visible_ids, key=key, reverse=True):
+    obj = runs[rid]
+    used = first_number(obj, ("active_miners", "current_miners", "miners", "occupied", "occupancy", "current"))
+    cap = first_number(obj, ("max_miners", "capacity", "total_slots", "max_nodes", "total"))
+    slots = first_number(obj, ("slots_remaining", "remaining", "available_slots", "free_slots"))
+    status = obj.get("state") or obj.get("status") or ("active" if obj.get("active") is True or obj.get("is_active") is True else "")
     detail = []
     if status: detail.append(str(status))
     if used is not None and cap is not None:
-        detail.append(f"{used}/{cap}，空位{max(0, cap-used)}")
+        free = slots if slots is not None else max(0, cap-used)
+        detail.append(f"{used}/{cap}，空位{free}")
     elif used is not None: detail.append(f"当前{used}")
     elif cap is not None: detail.append(f"容量{cap}")
+    metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+    desc = metadata.get("description")
+    if desc: detail.append(str(desc))
+    if obj.get("is_default") is True: detail.append("默认池")
     print(f"{rid}" + (" | " + " | ".join(detail) if detail else ""))
-print(f"合计识别：{len(runs)} 个 Run")
+print(f"合计识别：{len(visible_ids)} 个活跃 Run（接口总记录 {len(runs)}）")
 PY
+
+cat > "$STAGE/run_tracker.py" <<'PY'
+#!/usr/bin/python3
+"""Persist unique Run participation without touching IOTA state."""
+import os, re, sys
+from datetime import datetime
+from pathlib import Path
+
+path = Path.home() / ".iota-guardian" / "run_history.tsv"
+rid = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+valid = re.compile(r"^\d+\.\d+\.\d+\.\d+(?:-[A-Za-z0-9_-]+)?$")
+now = datetime.now().astimezone().isoformat(timespec="seconds")
+today = now[:10]
+rows = {}
+if path.exists():
+    for line in path.read_text(errors="replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4 and valid.match(parts[0]):
+            try: samples = int(parts[3])
+            except ValueError: samples = 0
+            rows[parts[0]] = [parts[1], parts[2], samples]
+if rid and valid.match(rid):
+    if rid in rows:
+        rows[rid][1] = now
+        rows[rid][2] += 1
+    else:
+        rows[rid] = [now, now, 1]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tsv.tmp")
+    tmp.write_text("".join(f"{key}\t{value[0]}\t{value[1]}\t{value[2]}\n"
+                           for key, value in sorted(rows.items())), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+today_count = sum(1 for value in rows.values() if value[1].startswith(today))
+print(f"{today_count}\t{len(rows)}")
+PY
+
+cat > "$STAGE/runs_refresh.sh" <<'REFRESH'
+#!/bin/zsh
+set -u
+BASE="$HOME/.iota-guardian"
+SUMMARY_TMP="$BASE/run_pool_summary.tsv.tmp"
+if /usr/bin/python3 "$BASE/runs_view.py" --summary-tsv > "$SUMMARY_TMP" 2> "$BASE/run-pool-error.log"; then
+  mv "$SUMMARY_TMP" "$BASE/run_pool_summary.tsv"
+else
+  rm -f "$SUMMARY_TMP"
+fi
+tail -n 30 "$BASE/run-pool-error.log" > "$BASE/run-pool-error.log.tmp" 2>/dev/null && mv "$BASE/run-pool-error.log.tmp" "$BASE/run-pool-error.log"
+REFRESH
 
 cat > "$STAGE/show_runs.sh" <<'RUNS'
 #!/bin/zsh
@@ -502,6 +663,23 @@ IFS=$'\t' read -r STATE POS RUNID LAYER EPOCH P2P ACTIVEAGE DETAIL FAILS OKS REG
 for FIELD in POS RUNID LAYER EPOCH P2P REGERROR; do
   [[ "${(P)FIELD:-}" == "-" ]] && typeset -g "$FIELD="
 done
+TRACKID=""
+case "$STATE" in
+  TRAINING|MERGING|SYNCING|RUN_IDLE|INITIALIZING) TRACKID="${RUNID:-}" ;;
+esac
+RUNSTATS=$(/usr/bin/python3 "$BASE/run_tracker.py" "$TRACKID" 2>/dev/null || print -r -- $'0\t0')
+IFS=$'\t' read -r RUNTODAY RUNTOTAL <<< "$RUNSTATS"
+RUNTODAY=${RUNTODAY:-0}; RUNTOTAL=${RUNTOTAL:-0}
+POOLTXT=""
+if [[ -s "$BASE/run_pool_summary.tsv" ]]; then
+  IFS=$'\t' read -r POOLTIME POOLACTIVE POOLALL POOLUSED POOLCAP POOLFREE POOLDEFAULT < "$BASE/run_pool_summary.tsv"
+  if [[ -n "${POOLACTIVE:-}" && "$POOLACTIVE" != "-" ]]; then
+    POOLTXT=" | 官方池${POOLACTIVE}个"
+    [[ -n "${POOLUSED:-}" && "$POOLUSED" != "-" && -n "${POOLCAP:-}" && "$POOLCAP" != "-" ]] && POOLTXT="${POOLTXT} · ${POOLUSED}/${POOLCAP}"
+    [[ -n "${POOLFREE:-}" && "$POOLFREE" != "-" ]] && POOLTXT="${POOLTXT} · 空位${POOLFREE}"
+    (( NOW-${POOLTIME:-0} <= 1800 )) || POOLTXT="${POOLTXT}(数据过期)"
+  fi
+fi
 CPU=$(/bin/ps -A -o %cpu=,command= | awk '/main_pool/ && !/awk/{s+=$1} END{printf "%.0f",s+0}')
 RUNINFO=""; [[ -n "$RUNID" ]] && RUNINFO="Run ${RUNID}"; [[ -n "$LAYER" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }L${LAYER}"; [[ -n "$EPOCH" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }E${EPOCH}"; [[ -n "$RUNINFO" ]] || RUNINFO="Run待更新"
 OLD=$(cat "$LAST" 2>/dev/null || echo '')
@@ -534,6 +712,7 @@ case "$STATE" in
  *) STATUS=down; MSG="🔴 状态未确认 | UNKNOWN | 进程存在但没有可确认状态 | CPU ${CPU}% | 日志${AGE}秒" ;;
 esac
 ((D<90)) || { STATUS=down; MSG="🔴 磁盘严重不足 | ${D}% | $MSG"; }
+MSG="$MSG | 今日Run ${RUNTODAY} · 累计${RUNTOTAL}${POOLTXT}"
 finish "$STATE" "$STATUS" "$MSG" "$AGE" "$POS" "$ACTIVEAGE"
 MONITOR
 
@@ -553,13 +732,29 @@ cat > "$STAGE/daily_report.sh" <<'REPORT'
 #!/bin/zsh
 BASE="$HOME/.iota-guardian"; TODAY=$(date '+%Y-%m-%d'); S="$BASE/samples-$TODAY.csv"; R="$BASE/reports/$TODAY.txt"; mkdir -p "$BASE/reports"
 count(){ grep -c ",\"$1\"," "$S" 2>/dev/null || true; }
+TRAIN=$(count TRAINING); MERGE=$(count MERGING); SYNC=$(count SYNCING)
+TOTAL=$(awk 'END{print (NR>0 ? NR-1 : 0)}' "$S" 2>/dev/null); TOTAL=${TOTAL:-0}
+PRODUCTIVE=$((TRAIN+MERGE+SYNC)); RATE=0; ((TOTAL>0)) && RATE=$((PRODUCTIVE*100/TOTAL))
+RUNSTATS=$(/usr/bin/python3 "$BASE/run_tracker.py" "" 2>/dev/null || print -r -- $'0\t0')
+IFS=$'\t' read -r RUNTODAY RUNTOTAL <<< "$RUNSTATS"
+POOL=$(cat "$BASE/run_pool_summary.tsv" 2>/dev/null || true)
+POOLL="暂无"
+if [[ -n "$POOL" ]]; then
+  IFS=$'\t' read -r PT PA PALL PU PC PF PD <<< "$POOL"
+  POOLL="活跃${PA}个"
+  [[ "$PU" != "-" && "$PC" != "-" ]] && POOLL="${POOLL}，已用${PU}/${PC}"
+  [[ "$PF" != "-" ]] && POOLL="${POOLL}，空位${PF}"
+fi
 cat > "$R" <<EOF2
-IOTA Guardian V6.3 每日报告
+IOTA Guardian V6.4 每日报告
 日期：$TODAY
 电脑：$(cat "$BASE/node_name" 2>/dev/null)
-真实训练：约 $(count TRAINING) 分钟
-合并阶段：约 $(count MERGING) 分钟
-权重同步：约 $(count SYNCING) 分钟
+本机参与Run：今日 ${RUNTODAY:-0} 个 / 累计 ${RUNTOTAL:-0} 个
+官方Run池：$POOLL
+真实训练：约 $TRAIN 分钟
+合并阶段：约 $MERGE 分钟
+权重同步：约 $SYNC 分钟
+有效在线占比：约 ${RATE}%（训练+合并+权重同步 / 当日监控样本）
 池内等待：约 $(count RUN_IDLE) 分钟
 排队：约 $(count QUEUED) 分钟
 注册阶段：CONFIRMED $(count CONFIRMED) / PROCESSING $(count PROCESSING) / REG_FAILED $(count REG_FAILED) 分钟
@@ -572,19 +767,22 @@ REPORT
 cat > "$STAGE/show_report.sh" <<'SHOW'
 #!/bin/zsh
 BASE="$HOME/.iota-guardian"
-echo "===== IOTA Guardian V6.3 本机仪表盘版 ====="
+echo "===== IOTA Guardian V6.4 Run统计增强版 ====="
 echo "版本：$(cat "$BASE/version" 2>/dev/null)"
 echo "电脑：$(cat "$BASE/node_name" 2>/dev/null)"
 echo "当前：$(cat "$BASE/current_message" 2>/dev/null)"
+echo "Run统计：$(/usr/bin/python3 "$BASE/run_tracker.py" "" 2>/dev/null | awk -F '\t' '{print "今日"$1"个 / 累计"$2"个"}')"
+echo "官方Run池：$(awk -F '\t' '{s="活跃"$2"个"; if($4!="-"&&$5!="-")s=s"，已用"$4"/"$5; if($6!="-")s=s"，空位"$6; print s}' "$BASE/run_pool_summary.tsv" 2>/dev/null || echo "暂未取得")"
 echo "最近状态变化："; tail -n 15 "$BASE/events.csv" 2>/dev/null
 echo; "$BASE/show_runs.sh" 2>/dev/null || true
 SHOW
 
-for item in monitor.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do chmod 700 "$STAGE/$item"; done
-chmod 700 "$STAGE/status_engine.py" "$STAGE/dashboard.py" "$STAGE/runs_view.py"
+for item in monitor.sh runs_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do chmod 700 "$STAGE/$item"; done
+chmod 700 "$STAGE/status_engine.py" "$STAGE/dashboard.py" "$STAGE/runs_view.py" "$STAGE/run_tracker.py"
 /usr/bin/python3 -m py_compile "$STAGE/status_engine.py"
 /usr/bin/python3 -m py_compile "$STAGE/dashboard.py"
 /usr/bin/python3 -m py_compile "$STAGE/runs_view.py"
+/usr/bin/python3 -m py_compile "$STAGE/run_tracker.py"
 
 make_plist(){
   local label="$1" script="$2" schedule="$3"
@@ -597,7 +795,8 @@ EOF2
 make_plist "$MONITOR_LABEL" monitor.sh '<key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>'
 make_plist "$CLEAN_LABEL" cleanup.sh '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>20</integer></dict>'
 make_plist "$REPORT_LABEL" daily_report.sh '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>55</integer></dict>'
-for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL"; do plutil -lint "$STAGE/$label.plist" >/dev/null; done
+make_plist "$POOL_LABEL" runs_refresh.sh '<key>RunAtLoad</key><true/><key>StartInterval</key><integer>600</integer>'
+for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL"; do plutil -lint "$STAGE/$label.plist" >/dev/null; done
 
 # 仅停用本系列旧监控，不碰 IOTA、钱包、hotkey 或第三方 hub agent。
 for plist in "$LAUNCH"/com.baibai.iota-log-monitor.plist "$LAUNCH"/com.baibai.iota-guardian*.plist; do
@@ -607,17 +806,18 @@ for plist in "$LAUNCH"/com.baibai.iota-log-monitor.plist "$LAUNCH"/com.baibai.io
   launchctl print "$GUI_DOMAIN/$old_label" >/dev/null 2>&1 && launchctl bootout "$GUI_DOMAIN/$old_label"
   mv "$plist" "$BACKUP/LaunchAgents/"
 done
-for item in monitor.sh status_engine.py dashboard.py runs_view.py show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do /usr/bin/install -m 700 "$STAGE/$item" "$BASE/$item"; done
+for item in monitor.sh status_engine.py dashboard.py runs_view.py run_tracker.py runs_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do /usr/bin/install -m 700 "$STAGE/$item" "$BASE/$item"; done
 for item in node_name push_url version; do /usr/bin/install -m 600 "$STAGE/$item" "$BASE/$item"; done
-for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL"; do /usr/bin/install -m 600 "$STAGE/$label.plist" "$LAUNCH/$label.plist"; launchctl bootstrap "$GUI_DOMAIN" "$LAUNCH/$label.plist"; done
+for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL"; do /usr/bin/install -m 600 "$STAGE/$label.plist" "$LAUNCH/$label.plist"; launchctl bootstrap "$GUI_DOMAIN" "$LAUNCH/$label.plist"; done
 mv "$STAGE" "$BACKUP/staged-install"; trap - ZERR
 
 echo
-echo "✅ IOTA Guardian V6.3 安装/升级完成"
+echo "✅ IOTA Guardian V6.4 安装/升级完成"
 echo "电脑：$(cat "$BASE/node_name")"
 echo "60秒检测一次；日志超过180秒才判定 STALE。"
 echo "TRAINING=真实计算；MERGING=合并；SYNCING=权重同步；CONFIRMED/PROCESSING=注册中；QUEUED=排队。"
 echo "查看全部 Run 池：$BASE/show_runs.sh"
 echo "打开本机实时仪表盘：$BASE/show_monitor.sh"
+echo "官方 Run 池每10分钟刷新；终端和 Kuma 同时显示今日/累计参与 Run 数。"
 echo "本工具不会启动、停止、重启或点击 IOTA，也不会修改钱包和 miner。"
 echo "请等待约60秒后查看 Uptime Kuma。"
