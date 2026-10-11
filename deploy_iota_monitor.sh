@@ -3,30 +3,31 @@ set -euo pipefail
 setopt null_glob
 umask 077
 
-# IOTA Guardian V6.4：精准状态、官方 Run 池容量、参与 Run 统计与本机实时仪表盘。
+# IOTA Guardian V6.5：精准状态、官方 Run/收益、参与 Run 统计与本机实时仪表盘。
 [[ "$(uname -s)" == Darwin ]] || { echo "本脚本仅支持 macOS。"; exit 1; }
 [[ "$(id -u)" != 0 ]] || { echo "请使用当前登录用户运行，不要使用 sudo。"; exit 1; }
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.4.0"
+VERSION="6.5.0"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
 CLEAN_LABEL="com.baibai.iota-guardian-v6.cleanup"
 REPORT_LABEL="com.baibai.iota-guardian-v6.report"
 POOL_LABEL="com.baibai.iota-guardian-v6.run-pool"
+REWARD_LABEL="com.baibai.iota-guardian-v6.rewards"
 mkdir -p "$BASE" "$LAUNCH" "$BASE/reports" "$BASE/backups"
 BACKUP=$(mktemp -d "$BASE/backups/before-v6-XXXXXXXX")
 STAGE=$(mktemp -d "$BASE/install-stage-XXXXXXXX")
 mkdir -p "$BACKUP/files" "$BACKUP/LaunchAgents"
-for item in node_name push_url version monitor.sh status_engine.py dashboard.py runs_view.py run_tracker.py runs_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state current_record.tsv queue_start_epoch low_p2p_count run_history.tsv run_pool_summary.tsv run_pool_display.txt; do
+for item in node_name push_url version monitor.sh status_engine.py dashboard.py runs_view.py run_tracker.py reward_tracker.py runs_refresh.sh rewards_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state current_record.tsv queue_start_epoch low_p2p_count run_history.tsv run_pool_summary.tsv reward_summary.tsv reward_snapshots.tsv hotkey; do
   [[ ! -f "$BASE/$item" ]] || cp -p "$BASE/$item" "$BACKUP/files/$item"
 done
 trap 'echo "安装未完成。备份：$BACKUP；请保留此目录，勿上传（含 Push URL）。" >&2' ZERR
 
 echo "=============================================="
-echo " IOTA Guardian V6.4 Run统计增强版"
+echo " IOTA Guardian V6.5 Run与收益增强版"
 echo "=============================================="
 echo "只监控、记录、告警和清理旧日志，不控制或重启 IOTA。"
 echo
@@ -299,6 +300,16 @@ def pool_stats(now):
     except Exception:
         return "-", "-", "-", "-", "-", "-", 999999
 
+def reward_stats(now):
+    cache = BASE / "reward_summary.tsv"
+    try:
+        values = cache.read_text(errors="replace").strip().split("\t")
+        values += ["-"] * (13 - len(values))
+        age = max(0, now - int(values[0]))
+        return values[2], values[3], values[4], values[5], values[7], values[8], values[9], values[10], values[11], values[12], age
+    except Exception:
+        return ("-",) * 10 + (999999,)
+
 def render():
     node = (BASE / "node_name").read_text(errors="ignore").strip() if (BASE / "node_name").exists() else os.uname().nodename
     version = (BASE / "version").read_text(errors="ignore").strip() if (BASE / "version").exists() else "未知"
@@ -307,6 +318,7 @@ def render():
     now = int(time.time())
     run_today, run_total = run_stats()
     pool_active, pool_total, pool_used, pool_cap, pool_free, pool_default, pool_age = pool_stats(now)
+    earned, paid, pending, frozen, reward_today, reward_week, reward_avg, last_reward, last_reward_ts, last_reward_status, reward_age = reward_stats(now)
 
     if not log:
         fields = ["NO_LOG"] + ["-"] * 12
@@ -353,6 +365,13 @@ def render():
         if pool_free != "-": pool_line += f" | 空位 {pool_free}"
         if pool_age > 1800: pool_line += "  ⚠️ 数据超过30分钟"
         lines.append(pool_line)
+    if earned != "-":
+        reward_line = f"官方收益：       累计 {earned} α | 今日结算 +{reward_today} | 7日均值 {reward_avg}/日"
+        if reward_age > 7200: reward_line += "  ⚠️ 数据超过2小时"
+        lines.append(reward_line)
+        lines.append(f"结算状态：       已支付 {paid} | 待支付 {pending} | 冻结 {frozen}")
+    else:
+        lines.append("官方收益：       待识别本机公开 hotkey（进入Run后自动获取）")
     lines += [
         f"最近有效计算：    {duration(activity_age)}" if activity_age != "-" else "最近有效计算：    暂无",
         f"判断依据：        {detail if detail != '-' else '暂无'}",
@@ -405,7 +424,7 @@ URLS = (
 RUN_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(?:-[A-Za-z0-9_-]+)?$")
 
 def fetch(url):
-    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.4", "Accept": "application/json"})
+    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.5", "Accept": "application/json"})
     with urlopen(req, timeout=12) as res:
         body = res.read()
         if res.headers.get("Content-Encoding", "").lower() == "gzip" or body[:2] == b"\x1f\x8b":
@@ -591,6 +610,161 @@ today_count = sum(1 for value in rows.values() if value[1].startswith(today))
 print(f"{today_count}\t{len(rows)}")
 PY
 
+cat > "$STAGE/reward_tracker.py" <<'PY'
+#!/usr/bin/python3
+"""Read public IOTA entitlement data for this miner hotkey. Never reads wallet secrets."""
+import gzip, json, os, re, sys, time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+BASE = Path.home() / ".iota-guardian"
+LOGDIR = Path.home() / "Library/Logs/IOTA Train at Home"
+HOTKEY_FILE = BASE / "hotkey"
+LOOKUP_FILE = BASE / "hotkey_lookup_epoch"
+SUMMARY_FILE = BASE / "reward_summary.tsv"
+API = "https://iota-web.api.macrocosmos.ai/mainnet"
+SS58 = re.compile(r"5[1-9A-HJ-NP-Za-km-z]{47}")
+PREFIX = re.compile(r"Miner\s+(5[1-9A-HJ-NP-Za-km-z]{7})\s+(?:registered successfully|in Layer)", re.I)
+
+def get(url):
+    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.5", "Accept": "application/json"})
+    with urlopen(req, timeout=20) as response:
+        body = response.read()
+        if response.headers.get("Content-Encoding", "").lower() == "gzip" or body[:2] == b"\x1f\x8b":
+            body = gzip.decompress(body)
+        return json.loads(body.decode("utf-8"))
+
+def read_tail(path, limit=8 * 1024 * 1024):
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size - limit))
+            return stream.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+def cached_hotkey():
+    try:
+        value = HOTKEY_FILE.read_text().strip()
+        return value if SS58.fullmatch(value) else ""
+    except Exception:
+        return ""
+
+def save_hotkey(value):
+    tmp = HOTKEY_FILE.with_suffix(".tmp")
+    tmp.write_text(value + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, HOTKEY_FILE)
+
+def discover_hotkey():
+    files = sorted(LOGDIR.glob("*-cli*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:6]
+    texts = [read_tail(path) for path in files]
+    prefix = ""
+    # Prefer a full key on a line explicitly naming the hotkey.
+    for text in texts:
+        for line in reversed(text.splitlines()):
+            if "hotkey" in line.lower():
+                matches = SS58.findall(line)
+                if matches:
+                    return matches[-1]
+            match = PREFIX.search(line)
+            if match and not prefix:
+                prefix = match.group(1)
+    if not prefix:
+        for text in texts:
+            match = PREFIX.search(text)
+            if match:
+                prefix = match.group(1); break
+    if prefix:
+        for text in texts:
+            matches = re.findall(re.escape(prefix) + r"[1-9A-HJ-NP-Za-km-z]{40}", text)
+            if matches:
+                return matches[-1]
+    # Avoid repeatedly scanning every official Run while the miner is still queued.
+    now = int(time.time())
+    try: last_lookup = int(LOOKUP_FILE.read_text().strip())
+    except Exception: last_lookup = 0
+    if not prefix or now - last_lookup < 21600:
+        return ""
+    LOOKUP_FILE.write_text(str(now) + "\n")
+    try:
+        runs = get(API + "/runs").get("runs", [])
+        found = set()
+        for run in runs:
+            if run.get("state") != "active" or not run.get("run_id"):
+                continue
+            miners = get(API + "/miners?run_id=" + quote(str(run["run_id"]), safe="-.")).get("miners", [])
+            for miner in miners:
+                value = miner.get("hotkey", "")
+                if isinstance(value, str) and value.startswith(prefix) and SS58.fullmatch(value):
+                    found.add(value)
+        if len(found) == 1:
+            return found.pop()
+    except Exception:
+        pass
+    return ""
+
+def number(value):
+    try: return float(value)
+    except (TypeError, ValueError): return 0.0
+
+def fmt(value):
+    return f"{value:.8f}".rstrip("0").rstrip(".") or "0"
+
+hotkey = cached_hotkey() or discover_hotkey()
+if not hotkey:
+    print("尚未识别本机公开 hotkey；进入 Run 后会自动重试。", file=sys.stderr)
+    raise SystemExit(2)
+save_hotkey(hotkey)
+
+totals = get(API + "/v1/entitlements/totals/hotkey/" + quote(hotkey, safe=""))
+try:
+    history = get(API + "/v1/entitlements/history/hotkey/" + quote(hotkey, safe=""))
+except Exception:
+    history = {}
+
+earned = number(totals.get("total_amount_earned"))
+paid = number(totals.get("total_amount_paid"))
+pending = number(totals.get("total_amount_pending"))
+frozen = number(totals.get("total_amount_frozen"))
+minimum = number(totals.get("minimum_payout_amount"))
+amounts = history.get("alpha_amounts", []) if isinstance(history, dict) else []
+timestamps = history.get("timestamps", []) if isinstance(history, dict) else []
+statuses = history.get("statuses", []) if isinstance(history, dict) else []
+events = []
+for index, timestamp in enumerate(timestamps if isinstance(timestamps, list) else []):
+    if index >= len(amounts): break
+    try:
+        epoch = int(timestamp); amount = float(amounts[index])
+    except (TypeError, ValueError):
+        continue
+    status = str(statuses[index]) if isinstance(statuses, list) and index < len(statuses) else "unknown"
+    events.append((epoch, amount, status))
+
+now = int(time.time())
+local_today = datetime.fromtimestamp(now).astimezone().date()
+today_amount = sum(amount for epoch, amount, _ in events
+                   if datetime.fromtimestamp(epoch).astimezone().date() == local_today)
+seven_amount = sum(amount for epoch, amount, _ in events if epoch >= now - 7 * 86400)
+seven_average = seven_amount / 7.0
+if events:
+    last_epoch, last_amount, last_status = max(events, key=lambda item: item[0])
+else:
+    last_epoch, last_amount, last_status = 0, 0.0, "-"
+
+fields = (str(now), hotkey, fmt(earned), fmt(paid), fmt(pending), fmt(frozen), fmt(minimum),
+          fmt(today_amount), fmt(seven_amount), fmt(seven_average), fmt(last_amount),
+          str(last_epoch), last_status.replace("\t", " ").replace("\n", " "))
+tmp = SUMMARY_FILE.with_suffix(".tsv.tmp")
+tmp.write_text("\t".join(fields) + "\n", encoding="utf-8")
+os.chmod(tmp, 0o600)
+os.replace(tmp, SUMMARY_FILE)
+print("\t".join(fields))
+PY
+
 cat > "$STAGE/runs_refresh.sh" <<'REFRESH'
 #!/bin/zsh
 set -u
@@ -603,6 +777,18 @@ else
 fi
 tail -n 30 "$BASE/run-pool-error.log" > "$BASE/run-pool-error.log.tmp" 2>/dev/null && mv "$BASE/run-pool-error.log.tmp" "$BASE/run-pool-error.log"
 REFRESH
+
+cat > "$STAGE/rewards_refresh.sh" <<'REWARDS'
+#!/bin/zsh
+set -u
+BASE="$HOME/.iota-guardian"
+# Existing installations stagger requests so a large Mac fleet does not hit the public API at once.
+[[ ! -s "$BASE/reward_summary.tsv" ]] || sleep $(( RANDOM % 120 ))
+if ! /usr/bin/python3 "$BASE/reward_tracker.py" > /dev/null 2> "$BASE/reward-error.log"; then
+  # Keep the last successful figures. Reward API failure must never mark IOTA down.
+  tail -n 30 "$BASE/reward-error.log" > "$BASE/reward-error.log.tmp" 2>/dev/null && mv "$BASE/reward-error.log.tmp" "$BASE/reward-error.log"
+fi
+REWARDS
 
 cat > "$STAGE/show_runs.sh" <<'RUNS'
 #!/bin/zsh
@@ -680,6 +866,14 @@ if [[ -s "$BASE/run_pool_summary.tsv" ]]; then
     (( NOW-${POOLTIME:-0} <= 1800 )) || POOLTXT="${POOLTXT}(数据过期)"
   fi
 fi
+REWARDTXT=""
+if [[ -s "$BASE/reward_summary.tsv" ]]; then
+  IFS=$'\t' read -r REWARDTIME REWARDHOTKEY REWARDEARNED REWARDPAID REWARDPENDING REWARDFROZEN REWARDMIN REWARDTODAY REWARDWEEK REWARDAVG REWARDLAST REWARDLASTTIME REWARDSTATUS < "$BASE/reward_summary.tsv"
+  if [[ -n "${REWARDEARNED:-}" && "$REWARDEARNED" != "-" ]]; then
+    REWARDTXT=" | 收益累计${REWARDEARNED}α · 今日结算+${REWARDTODAY:-0} · 待付${REWARDPENDING:-0}"
+    [[ "${REWARDTIME:-}" == <-> ]] && (( NOW-REWARDTIME <= 7200 )) || REWARDTXT="${REWARDTXT}(数据过期)"
+  fi
+fi
 CPU=$(/bin/ps -A -o %cpu=,command= | awk '/main_pool/ && !/awk/{s+=$1} END{printf "%.0f",s+0}')
 RUNINFO=""; [[ -n "$RUNID" ]] && RUNINFO="Run ${RUNID}"; [[ -n "$LAYER" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }L${LAYER}"; [[ -n "$EPOCH" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }E${EPOCH}"; [[ -n "$RUNINFO" ]] || RUNINFO="Run待更新"
 OLD=$(cat "$LAST" 2>/dev/null || echo '')
@@ -712,7 +906,7 @@ case "$STATE" in
  *) STATUS=down; MSG="🔴 状态未确认 | UNKNOWN | 进程存在但没有可确认状态 | CPU ${CPU}% | 日志${AGE}秒" ;;
 esac
 ((D<90)) || { STATUS=down; MSG="🔴 磁盘严重不足 | ${D}% | $MSG"; }
-MSG="$MSG | 今日Run ${RUNTODAY} · 累计${RUNTOTAL}${POOLTXT}"
+MSG="$MSG | 今日Run ${RUNTODAY} · 累计${RUNTOTAL}${POOLTXT}${REWARDTXT}"
 finish "$STATE" "$STATUS" "$MSG" "$AGE" "$POS" "$ACTIVEAGE"
 MONITOR
 
@@ -745,12 +939,18 @@ if [[ -n "$POOL" ]]; then
   [[ "$PU" != "-" && "$PC" != "-" ]] && POOLL="${POOLL}，已用${PU}/${PC}"
   [[ "$PF" != "-" ]] && POOLL="${POOLL}，空位${PF}"
 fi
+REWARDL="待识别hotkey或官方接口暂不可用"
+if [[ -s "$BASE/reward_summary.tsv" ]]; then
+  IFS=$'\t' read -r RT RH RE RP RPN RF RM RDAY RWEEK RAVG RLAST RLASTT RSTATUS < "$BASE/reward_summary.tsv"
+  REWARDL="累计${RE} α，今日结算+${RDAY}，7日合计${RWEEK}，7日均值${RAVG}/日，已支付${RP}，待支付${RPN}，冻结${RF}"
+fi
 cat > "$R" <<EOF2
-IOTA Guardian V6.4 每日报告
+IOTA Guardian V6.5 每日报告
 日期：$TODAY
 电脑：$(cat "$BASE/node_name" 2>/dev/null)
 本机参与Run：今日 ${RUNTODAY:-0} 个 / 累计 ${RUNTOTAL:-0} 个
 官方Run池：$POOLL
+官方收益：$REWARDL
 真实训练：约 $TRAIN 分钟
 合并阶段：约 $MERGE 分钟
 权重同步：约 $SYNC 分钟
@@ -767,22 +967,24 @@ REPORT
 cat > "$STAGE/show_report.sh" <<'SHOW'
 #!/bin/zsh
 BASE="$HOME/.iota-guardian"
-echo "===== IOTA Guardian V6.4 Run统计增强版 ====="
+echo "===== IOTA Guardian V6.5 Run与收益增强版 ====="
 echo "版本：$(cat "$BASE/version" 2>/dev/null)"
 echo "电脑：$(cat "$BASE/node_name" 2>/dev/null)"
 echo "当前：$(cat "$BASE/current_message" 2>/dev/null)"
 echo "Run统计：$(/usr/bin/python3 "$BASE/run_tracker.py" "" 2>/dev/null | awk -F '\t' '{print "今日"$1"个 / 累计"$2"个"}')"
 echo "官方Run池：$(awk -F '\t' '{s="活跃"$2"个"; if($4!="-"&&$5!="-")s=s"，已用"$4"/"$5; if($6!="-")s=s"，空位"$6; print s}' "$BASE/run_pool_summary.tsv" 2>/dev/null || echo "暂未取得")"
+echo "官方收益：$(awk -F '\t' '{print "累计"$3" α，今日结算+"$8"，7日均值"$10"/日，已支付"$4"，待支付"$5"，冻结"$6}' "$BASE/reward_summary.tsv" 2>/dev/null || echo "暂未取得")"
 echo "最近状态变化："; tail -n 15 "$BASE/events.csv" 2>/dev/null
 echo; "$BASE/show_runs.sh" 2>/dev/null || true
 SHOW
 
-for item in monitor.sh runs_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do chmod 700 "$STAGE/$item"; done
-chmod 700 "$STAGE/status_engine.py" "$STAGE/dashboard.py" "$STAGE/runs_view.py" "$STAGE/run_tracker.py"
+for item in monitor.sh runs_refresh.sh rewards_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do chmod 700 "$STAGE/$item"; done
+chmod 700 "$STAGE/status_engine.py" "$STAGE/dashboard.py" "$STAGE/runs_view.py" "$STAGE/run_tracker.py" "$STAGE/reward_tracker.py"
 /usr/bin/python3 -m py_compile "$STAGE/status_engine.py"
 /usr/bin/python3 -m py_compile "$STAGE/dashboard.py"
 /usr/bin/python3 -m py_compile "$STAGE/runs_view.py"
 /usr/bin/python3 -m py_compile "$STAGE/run_tracker.py"
+/usr/bin/python3 -m py_compile "$STAGE/reward_tracker.py"
 
 make_plist(){
   local label="$1" script="$2" schedule="$3"
@@ -796,7 +998,8 @@ make_plist "$MONITOR_LABEL" monitor.sh '<key>RunAtLoad</key><true/><key>StartInt
 make_plist "$CLEAN_LABEL" cleanup.sh '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>20</integer></dict>'
 make_plist "$REPORT_LABEL" daily_report.sh '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>55</integer></dict>'
 make_plist "$POOL_LABEL" runs_refresh.sh '<key>RunAtLoad</key><true/><key>StartInterval</key><integer>600</integer>'
-for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL"; do plutil -lint "$STAGE/$label.plist" >/dev/null; done
+make_plist "$REWARD_LABEL" rewards_refresh.sh '<key>RunAtLoad</key><true/><key>StartInterval</key><integer>3600</integer>'
+for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL" "$REWARD_LABEL"; do plutil -lint "$STAGE/$label.plist" >/dev/null; done
 
 # 仅停用本系列旧监控，不碰 IOTA、钱包、hotkey 或第三方 hub agent。
 for plist in "$LAUNCH"/com.baibai.iota-log-monitor.plist "$LAUNCH"/com.baibai.iota-guardian*.plist; do
@@ -806,18 +1009,20 @@ for plist in "$LAUNCH"/com.baibai.iota-log-monitor.plist "$LAUNCH"/com.baibai.io
   launchctl print "$GUI_DOMAIN/$old_label" >/dev/null 2>&1 && launchctl bootout "$GUI_DOMAIN/$old_label"
   mv "$plist" "$BACKUP/LaunchAgents/"
 done
-for item in monitor.sh status_engine.py dashboard.py runs_view.py run_tracker.py runs_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do /usr/bin/install -m 700 "$STAGE/$item" "$BASE/$item"; done
+for item in monitor.sh status_engine.py dashboard.py runs_view.py run_tracker.py reward_tracker.py runs_refresh.sh rewards_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do /usr/bin/install -m 700 "$STAGE/$item" "$BASE/$item"; done
 for item in node_name push_url version; do /usr/bin/install -m 600 "$STAGE/$item" "$BASE/$item"; done
-for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL"; do /usr/bin/install -m 600 "$STAGE/$label.plist" "$LAUNCH/$label.plist"; launchctl bootstrap "$GUI_DOMAIN" "$LAUNCH/$label.plist"; done
+for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL" "$REWARD_LABEL"; do /usr/bin/install -m 600 "$STAGE/$label.plist" "$LAUNCH/$label.plist"; launchctl bootstrap "$GUI_DOMAIN" "$LAUNCH/$label.plist"; done
 mv "$STAGE" "$BACKUP/staged-install"; trap - ZERR
 
 echo
-echo "✅ IOTA Guardian V6.4 安装/升级完成"
+echo "✅ IOTA Guardian V6.5 安装/升级完成"
 echo "电脑：$(cat "$BASE/node_name")"
 echo "60秒检测一次；日志超过180秒才判定 STALE。"
 echo "TRAINING=真实计算；MERGING=合并；SYNCING=权重同步；CONFIRMED/PROCESSING=注册中；QUEUED=排队。"
 echo "查看全部 Run 池：$BASE/show_runs.sh"
 echo "打开本机实时仪表盘：$BASE/show_monitor.sh"
-echo "官方 Run 池每10分钟刷新；终端和 Kuma 同时显示今日/累计参与 Run 数。"
+echo "官方 Run 池每10分钟刷新；官方收益每60分钟刷新。"
+echo "收益只读取公开 hotkey 的官方 entitlement，不读取钱包、助记词或私钥。"
+echo "终端和 Kuma 同时显示今日/累计参与 Run 数及官方结算收益。"
 echo "本工具不会启动、停止、重启或点击 IOTA，也不会修改钱包和 miner。"
 echo "请等待约60秒后查看 Uptime Kuma。"
