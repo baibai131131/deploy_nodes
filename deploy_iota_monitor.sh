@@ -3,13 +3,13 @@ set -euo pipefail
 setopt null_glob
 umask 077
 
-# IOTA Guardian V6.5：精准状态、官方 Run/收益、参与 Run 统计与本机实时仪表盘。
+# IOTA Guardian V6.5.1：精准状态、官方 Run/收益、参与 Run 统计与本机实时仪表盘。
 [[ "$(uname -s)" == Darwin ]] || { echo "本脚本仅支持 macOS。"; exit 1; }
 [[ "$(id -u)" != 0 ]] || { echo "请使用当前登录用户运行，不要使用 sudo。"; exit 1; }
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.5.0"
+VERSION="6.5.1"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
@@ -21,13 +21,13 @@ mkdir -p "$BASE" "$LAUNCH" "$BASE/reports" "$BASE/backups"
 BACKUP=$(mktemp -d "$BASE/backups/before-v6-XXXXXXXX")
 STAGE=$(mktemp -d "$BASE/install-stage-XXXXXXXX")
 mkdir -p "$BACKUP/files" "$BACKUP/LaunchAgents"
-for item in node_name push_url version monitor.sh status_engine.py dashboard.py runs_view.py run_tracker.py reward_tracker.py runs_refresh.sh rewards_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state current_record.tsv queue_start_epoch low_p2p_count run_history.tsv run_pool_summary.tsv reward_summary.tsv reward_snapshots.tsv hotkey; do
+for item in node_name push_url version monitor.sh status_engine.py dashboard.py runs_view.py run_tracker.py reward_tracker.py runs_refresh.sh rewards_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh last_state current_record.tsv queue_start_epoch restart_required.tsv low_p2p_count run_history.tsv run_pool_summary.tsv reward_summary.tsv reward_snapshots.tsv hotkey; do
   [[ ! -f "$BASE/$item" ]] || cp -p "$BASE/$item" "$BACKUP/files/$item"
 done
 trap 'echo "安装未完成。备份：$BACKUP；请保留此目录，勿上传（含 Push URL）。" >&2' ZERR
 
 echo "=============================================="
-echo " IOTA Guardian V6.5 Run与收益增强版"
+echo " IOTA Guardian V6.5.1 Run与收益增强版"
 echo "=============================================="
 echo "只监控、记录、告警和清理旧日志，不控制或重启 IOTA。"
 echo
@@ -99,6 +99,10 @@ send_fail = send_ok = 0
 reg_error = ""
 reg_error_ts = None
 queue_warn_ts = None
+midrun_reset_ts = None
+cached_reset_ts = None
+last_boot_ts = None
+ACTIVE_STATES = {"TRAINING", "MERGING", "SYNCING", "RUN_IDLE", "INITIALIZING"}
 
 def set_state(value, i, ts, hard=False):
     global state, state_i, state_ts, barrier_i
@@ -109,6 +113,14 @@ def set_state(value, i, ts, hard=False):
 for i, line in enumerate(lines):
     low = line.lower()
     ts = line_epoch(line)
+
+    # A full client/miner start after a reset proves that the user restarted it.
+    if ts is not None and (
+            re.search(r"\bstarting miner\b", line, re.I) or
+            "initializing bittensor wallet" in low or
+            "p2p start: begin" in low or
+            "protocol server started in separate process" in low):
+        last_boot_ts = ts
 
     m = re.search(r"position[^0-9]*([0-9]+)", line, re.I)
     if m: pos = m.group(1)
@@ -132,6 +144,12 @@ for i, line in enumerate(lines):
             "register_set_queue_state exhausted retries" in low):
         queue_warn_ts = ts
 
+    # The GUI line below is only actionable when it follows a reset from an
+    # active Run. It must not be confused with a normal cached speed test.
+    if "using cached speedtest result" in low and ts is not None and midrun_reset_ts is not None:
+        if 0 <= ts - midrun_reset_ts <= 300:
+            cached_reset_ts = ts
+
     # Newer state-changing events always override older activity.
     if ("signal=sigabrt" in low or "training exited with code=1" in low or
             "training process exited with code 1" in low or "miner process exited" in low):
@@ -145,6 +163,15 @@ for i, line in enumerate(lines):
     # events prove that an existing registration was actually discarded.
     if ("resetting miner entire state" in low or
             "appears to have been kicked" in low or "miner.kicked" in low):
+        active_before = state in ACTIVE_STATES
+        if ts is not None and last_activity_ts is not None and 0 <= ts - last_activity_ts <= 900:
+            active_before = True
+        if ts is not None:
+            if active_before:
+                midrun_reset_ts = ts
+            elif midrun_reset_ts is not None and 0 <= ts - midrun_reset_ts <= 300:
+                # "kicked" and "resetting" can be two lines from the same event.
+                midrun_reset_ts = ts
         set_state("RESETTING", i, ts, True); continue
     if re.search(r"status['\"]?\s*:\s*['\"]failed", low):
         pos = ""
@@ -209,7 +236,8 @@ detail = last_activity_name or "无近期有效训练事件"
 reg_error_age = 999999 if reg_error_ts is None else max(0, now - reg_error_ts)
 queue_warn_age = 999999 if queue_warn_ts is None else max(0, now - queue_warn_ts)
 values = [state, pos or "-", run or "-", layer or "-", epoch or "-", p2p or "-", str(activity_age), detail,
-          str(send_fail), str(send_ok), reg_error or "-", str(reg_error_age), str(queue_warn_age)]
+          str(send_fail), str(send_ok), reg_error or "-", str(reg_error_age), str(queue_warn_age),
+          str(cached_reset_ts or 0), str(last_boot_ts or 0), str(last_activity_ts or 0)]
 print("\t".join(v.replace("\t", " ").replace("\n", " ") for v in values))
 PY
 
@@ -231,6 +259,7 @@ LABELS = {
     "INITIALIZING": ("🟠", "训练池初始化"), "CONFIRMED": ("🔵", "已到队首确认"),
     "PROCESSING": ("🟠", "注册处理中"), "REG_FAILED": ("🔴", "注册确认失败"),
     "QUEUED": ("🔵", "正常排队"), "RESETTING": ("🔴", "注册被重置"),
+    "RESTART_REQUIRED": ("🔴", "训练中途被重置，建议人工重启"),
     "CRASHED": ("🔴", "程序崩溃"), "STOPPED": ("🔴", "IOTA停止"),
     "STALE": ("🔴", "日志卡住"), "NO_LOG": ("🔴", "没有日志"),
     "UNKNOWN": ("🔴", "状态未确认"),
@@ -331,6 +360,8 @@ def render():
         state = "STOPPED"
     elif age > 180:
         state = "STALE"
+    elif (BASE / "restart_required.tsv").exists() and state != "TRAINING":
+        state = "RESTART_REQUIRED"
 
     icon, label = LABELS.get(state, ("🔴", "状态未确认"))
     free = shutil.disk_usage("/").free / 1024**3
@@ -424,7 +455,7 @@ URLS = (
 RUN_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(?:-[A-Za-z0-9_-]+)?$")
 
 def fetch(url):
-    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.5", "Accept": "application/json"})
+    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.5.1", "Accept": "application/json"})
     with urlopen(req, timeout=12) as res:
         body = res.read()
         if res.headers.get("Content-Encoding", "").lower() == "gzip" or body[:2] == b"\x1f\x8b":
@@ -629,7 +660,7 @@ SS58 = re.compile(r"5[1-9A-HJ-NP-Za-km-z]{47}")
 PREFIX = re.compile(r"Miner\s+(5[1-9A-HJ-NP-Za-km-z]{7})\s+(?:registered successfully|in Layer)", re.I)
 
 def get(url):
-    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.5", "Accept": "application/json"})
+    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.5.1", "Accept": "application/json"})
     with urlopen(req, timeout=20) as response:
         body = response.read()
         if response.headers.get("Content-Encoding", "").lower() == "gzip" or body[:2] == b"\x1f\x8b":
@@ -806,7 +837,7 @@ PUSH=$(cat "$BASE/push_url" 2>/dev/null || echo '')
 PUSH="${PUSH%%\?*}"
 NOW=$(date +%s); NOWTXT=$(date '+%Y-%m-%d %H:%M:%S'); TODAY=$(date '+%Y-%m-%d')
 RUNLOG="$BASE/guardian.log"; EVENTS="$BASE/events.csv"; SAMPLES="$BASE/samples-$TODAY.csv"
-LAST="$BASE/last_state"; QUEUE_START="$BASE/queue_start_epoch"
+LAST="$BASE/last_state"; QUEUE_START="$BASE/queue_start_epoch"; RESTART_LATCH="$BASE/restart_required.tsv"
 trim(){ [[ -f "$1" ]] || return 0; tail -n "$2" "$1" > "$1.tmp" 2>/dev/null && mv "$1.tmp" "$1"; }
 log(){ echo "$NOWTXT | $NODE | $1" >> "$RUNLOG"; trim "$RUNLOG" 1500; }
 disk(){ df -Pk / | awk 'NR==2{gsub("%","",$5);print $5}'; }
@@ -844,11 +875,29 @@ APP=0; CLI=0
 
 RESULT=$(/usr/bin/python3 "$BASE/status_engine.py" "$LATEST" 2>/dev/null)
 print -r -- "$RESULT" > "$BASE/current_record.tsv.tmp" && mv "$BASE/current_record.tsv.tmp" "$BASE/current_record.tsv"
-IFS=$'\t' read -r STATE POS RUNID LAYER EPOCH P2P ACTIVEAGE DETAIL FAILS OKS REGERROR REGERRORAGE QUEUEWARNAGE <<< "$RESULT"
+IFS=$'\t' read -r STATE POS RUNID LAYER EPOCH P2P ACTIVEAGE DETAIL FAILS OKS REGERROR REGERRORAGE QUEUEWARNAGE RESETEVENT BOOTEVENT ACTIVITYEVENT <<< "$RESULT"
 [[ -n "${STATE:-}" ]] || STATE=UNKNOWN
 for FIELD in POS RUNID LAYER EPOCH P2P REGERROR; do
   [[ "${(P)FIELD:-}" == "-" ]] && typeset -g "$FIELD="
 done
+RESETEVENT=${RESETEVENT:-0}; BOOTEVENT=${BOOTEVENT:-0}; ACTIVITYEVENT=${ACTIVITYEVENT:-0}
+
+# Persist the warning because QUEUED otherwise replaces RESETTING within seconds.
+# It is cleared only by a later full client start or later real training activity.
+if [[ "$RESETEVENT" == <-> ]] && (( RESETEVENT > 0 )); then
+  OLD_ALERT=$(cut -f1 "$RESTART_LATCH" 2>/dev/null || echo 0)
+  [[ "$OLD_ALERT" == <-> ]] || OLD_ALERT=0
+  if (( RESETEVENT > OLD_ALERT )); then
+    print -r -- "$RESETEVENT\t$NOWTXT" > "$RESTART_LATCH"
+  fi
+fi
+ALERT_TS=$(cut -f1 "$RESTART_LATCH" 2>/dev/null || echo 0)
+[[ "$ALERT_TS" == <-> ]] || ALERT_TS=0
+CLEAR_TS=0
+[[ "$BOOTEVENT" == <-> ]] && (( BOOTEVENT > CLEAR_TS )) && CLEAR_TS=$BOOTEVENT
+[[ "$ACTIVITYEVENT" == <-> ]] && (( ACTIVITYEVENT > CLEAR_TS )) && CLEAR_TS=$ACTIVITYEVENT
+(( ALERT_TS > 0 && CLEAR_TS > ALERT_TS )) && { rm -f "$RESTART_LATCH"; ALERT_TS=0; }
+
 TRACKID=""
 case "$STATE" in
   TRAINING|MERGING|SYNCING|RUN_IDLE|INITIALIZING) TRACKID="${RUNID:-}" ;;
@@ -878,7 +927,7 @@ CPU=$(/bin/ps -A -o %cpu=,command= | awk '/main_pool/ && !/awk/{s+=$1} END{print
 RUNINFO=""; [[ -n "$RUNID" ]] && RUNINFO="Run ${RUNID}"; [[ -n "$LAYER" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }L${LAYER}"; [[ -n "$EPOCH" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }E${EPOCH}"; [[ -n "$RUNINFO" ]] || RUNINFO="Run待更新"
 OLD=$(cat "$LAST" 2>/dev/null || echo '')
 if [[ "$STATE" == QUEUED ]]; then
-  [[ "$OLD" == QUEUED && -s "$QUEUE_START" ]] || print -r -- "$NOW" > "$QUEUE_START"
+  [[ -s "$QUEUE_START" ]] || print -r -- "$NOW" > "$QUEUE_START"
 else rm -f "$QUEUE_START"; fi
 QTXT=""; [[ "$STATE" == QUEUED && -s "$QUEUE_START" ]] && QTXT=$(duration $((NOW-$(cat "$QUEUE_START"))))
 ATXT="无近期有效计算"; [[ "$ACTIVEAGE" != 999999 ]] && ATXT="上次有效计算$(duration "$ACTIVEAGE")前"
@@ -905,6 +954,19 @@ case "$STATE" in
  STOPPED) STATUS=down; MSG="🔴 IOTA停止 | STOPPED | 请点击 Start training | 日志${AGE}秒" ;;
  *) STATUS=down; MSG="🔴 状态未确认 | UNKNOWN | 进程存在但没有可确认状态 | CPU ${CPU}% | 日志${AGE}秒" ;;
 esac
+
+# Keep the reset warning visible while live queue details continue to refresh.
+if [[ -s "$RESTART_LATCH" ]]; then
+  ALERT_TS=$(cut -f1 "$RESTART_LATCH" 2>/dev/null || echo 0)
+  ALERT_WHEN=$(/bin/date -r "${ALERT_TS:-0}" '+%m-%d %H:%M' 2>/dev/null || echo "时间待更新")
+  LIVE="当前状态${STATE}"
+  [[ "$STATE" == QUEUED ]] && LIVE="当前已重新排队${POS:+，位置${POS}}"
+  [[ "$STATE" == CONFIRMED ]] && LIVE="当前已到队首确认"
+  [[ "$STATE" == PROCESSING ]] && LIVE="当前注册处理中"
+  STATE=RESTART_REQUIRED
+  STATUS=down
+  MSG="🔴 训练中途被重置 | RESTART_REQUIRED | ${ALERT_WHEN}出现缓存测速界面 | ${LIVE} | 建议手动重启；若自动恢复真实训练将解除 | 日志${AGE}秒"
+fi
 ((D<90)) || { STATUS=down; MSG="🔴 磁盘严重不足 | ${D}% | $MSG"; }
 MSG="$MSG | 今日Run ${RUNTODAY} · 累计${RUNTOTAL}${POOLTXT}${REWARDTXT}"
 finish "$STATE" "$STATUS" "$MSG" "$AGE" "$POS" "$ACTIVEAGE"
@@ -945,7 +1007,7 @@ if [[ -s "$BASE/reward_summary.tsv" ]]; then
   REWARDL="累计${RE} α，今日结算+${RDAY}，7日合计${RWEEK}，7日均值${RAVG}/日，已支付${RP}，待支付${RPN}，冻结${RF}"
 fi
 cat > "$R" <<EOF2
-IOTA Guardian V6.5 每日报告
+IOTA Guardian V6.5.1 每日报告
 日期：$TODAY
 电脑：$(cat "$BASE/node_name" 2>/dev/null)
 本机参与Run：今日 ${RUNTODAY:-0} 个 / 累计 ${RUNTOTAL:-0} 个
@@ -958,7 +1020,7 @@ IOTA Guardian V6.5 每日报告
 池内等待：约 $(count RUN_IDLE) 分钟
 排队：约 $(count QUEUED) 分钟
 注册阶段：CONFIRMED $(count CONFIRMED) / PROCESSING $(count PROCESSING) / REG_FAILED $(count REG_FAILED) 分钟
-故障：RESETTING $(count RESETTING) / CRASHED $(count CRASHED) / STOPPED $(count STOPPED) / STALE $(count STALE) 分钟
+故障：RESTART_REQUIRED $(count RESTART_REQUIRED) / RESETTING $(count RESETTING) / CRASHED $(count CRASHED) / STOPPED $(count STOPPED) / STALE $(count STALE) 分钟
 当前：$(cat "$BASE/current_message" 2>/dev/null)
 EOF2
 find "$BASE/reports" -type f -mtime +31 -delete 2>/dev/null || true
@@ -967,7 +1029,7 @@ REPORT
 cat > "$STAGE/show_report.sh" <<'SHOW'
 #!/bin/zsh
 BASE="$HOME/.iota-guardian"
-echo "===== IOTA Guardian V6.5 Run与收益增强版 ====="
+echo "===== IOTA Guardian V6.5.1 Run与收益增强版 ====="
 echo "版本：$(cat "$BASE/version" 2>/dev/null)"
 echo "电脑：$(cat "$BASE/node_name" 2>/dev/null)"
 echo "当前：$(cat "$BASE/current_message" 2>/dev/null)"
@@ -1015,10 +1077,11 @@ for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL" "$REW
 mv "$STAGE" "$BACKUP/staged-install"; trap - ZERR
 
 echo
-echo "✅ IOTA Guardian V6.5 安装/升级完成"
+echo "✅ IOTA Guardian V6.5.1 安装/升级完成"
 echo "电脑：$(cat "$BASE/node_name")"
 echo "60秒检测一次；日志超过180秒才判定 STALE。"
 echo "TRAINING=真实计算；MERGING=合并；SYNCING=权重同步；CONFIRMED/PROCESSING=注册中；QUEUED=排队。"
+echo "RESTART_REQUIRED=训练中途重置后出现缓存测速；人工重启或恢复真实训练后自动解除。"
 echo "查看全部 Run 池：$BASE/show_runs.sh"
 echo "打开本机实时仪表盘：$BASE/show_monitor.sh"
 echo "官方 Run 池每10分钟刷新；官方收益每60分钟刷新。"
