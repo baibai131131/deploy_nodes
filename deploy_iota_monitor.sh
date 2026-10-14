@@ -888,7 +888,208 @@ if [[ "$RESETEVENT" == <-> ]] && (( RESETEVENT > 0 )); then
   OLD_ALERT=$(cut -f1 "$RESTART_LATCH" 2>/dev/null || echo 0)
   [[ "$OLD_ALERT" == <-> ]] || OLD_ALERT=0
   if (( RESETEVENT > OLD_ALERT )); then
-    print -r -- "$RESETEVENT\t$NOWTXT" > "$RESTART_LATCH"
+    print -r -- "$RESETEVENT"
+  fi
+fi
+ALERT_TS=$(cut -f1 "$RESTART_LATCH" 2>/dev/null || echo 0)
+[[ "$ALERT_TS" == <-> ]] || ALERT_TS=0
+CLEAR_TS=0
+[[ "$BOOTEVENT" == <-> ]] && (( BOOTEVENT > CLEAR_TS )) && CLEAR_TS=$BOOTEVENT
+[[ "$ACTIVITYEVENT" == <-> ]] && (( ACTIVITYEVENT > CLEAR_TS )) && CLEAR_TS=$ACTIVITYEVENT
+(( ALERT_TS > 0 && CLEAR_TS > ALERT_TS )) && { rm -f "$RESTART_LATCH"; ALERT_TS=0; }
+
+TRACKID=""
+case "$STATE" in
+  TRAINING|MERGING|SYNCING|RUN_IDLE|INITIALIZING) TRACKID="${RUNID:-}" ;;
+esac
+RUNSTATS=$(/usr/bin/python3 "$BASE/run_tracker.py" "$TRACKID" 2>/dev/null || print -r -- $'0\t0')
+IFS=$'\t' read -r RUNTODAY RUNTOTAL <<< "$RUNSTATS"
+RUNTODAY=${RUNTODAY:-0}; RUNTOTAL=${RUNTOTAL:-0}
+POOLTXT=""
+if [[ -s "$BASE/run_pool_summary.tsv" ]]; then
+  IFS=$'\t' read -r POOLTIME POOLACTIVE POOLALL POOLUSED POOLCAP POOLFREE POOLDEFAULT < "$BASE/run_pool_summary.tsv"
+  if [[ -n "${POOLACTIVE:-}" && "$POOLACTIVE" != "-" ]]; then
+    POOLTXT=" | 官方池${POOLACTIVE}个"
+    [[ -n "${POOLUSED:-}" && "$POOLUSED" != "-" && -n "${POOLCAP:-}" && "$POOLCAP" != "-" ]] && POOLTXT="${POOLTXT} · ${POOLUSED}/${POOLCAP}"
+    [[ -n "${POOLFREE:-}" && "$POOLFREE" != "-" ]] && POOLTXT="${POOLTXT} · 空位${POOLFREE}"
+    (( NOW-${POOLTIME:-0} <= 1800 )) || POOLTXT="${POOLTXT}(数据过期)"
+  fi
+fi
+REWARDTXT=""
+if [[ -s "$BASE/reward_summary.tsv" ]]; then
+  IFS=$'\t' read -r REWARDTIME REWARDHOTKEY REWARDEARNED REWARDPAID REWARDPENDING REWARDFROZEN REWARDMIN REWARDTODAY REWARDWEEK REWARDAVG REWARDLAST REWARDLASTTIME REWARDSTATUS < "$BASE/reward_summary.tsv"
+  if [[ -n "${REWARDEARNED:-}" && "$REWARDEARNED" != "-" ]]; then
+    REWARDTXT=" | 收益累计${REWARDEARNED}α · 今日结算+${REWARDTODAY:-0} · 待付${REWARDPENDING:-0}"
+    [[ "${REWARDTIME:-}" == <-> ]] && (( NOW-REWARDTIME <= 7200 )) || REWARDTXT="${REWARDTXT}(数据过期)"
+  fi
+fi
+CPU=$(/bin/ps -A -o %cpu=,command= | awk '/main_pool/ && !/awk/{s+=$1} END{printf "%.0f",s+0}')
+RUNINFO=""; [[ -n "$RUNID" ]] && RUNINFO="Run ${RUNID}"; [[ -n "$LAYER" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }L${LAYER}"; [[ -n "$EPOCH" ]] && RUNINFO="${RUNINFO}${RUNINFO:+ · }E${EPOCH}"; [[ -n "$RUNINFO" ]] || RUNINFO="Run待更新"
+OLD=$(cat "$LAST" 2>/dev/null || echo '')
+if [[ "$STATE" == QUEUED ]]; then
+  [[ -s "$QUEUE_START" ]] || print -r -- "$NOW" > "$QUEUE_START"
+else rm -f "$QUEUE_START"; fi
+QTXT=""; [[ "$STATE" == QUEUED && -s "$QUEUE_START" ]] && QTXT=$(duration $((NOW-$(cat "$QUEUE_START"))))
+ATXT="无近期有效计算"; [[ "$ACTIVEAGE" != 999999 ]] && ATXT="上次有效计算$(duration "$ACTIVEAGE")前"
+WARN=""
+[[ -n "${REGERROR:-}" && "${REGERRORAGE:-999999}" -le 21600 ]] && WARN=" | 上轮确认失败 ${REGERROR}"
+[[ "${QUEUEWARNAGE:-999999}" -le 600 ]] && WARN="${WARN} | 调度接口503"
+NETWARN=""
+if [[ "$P2P" =~ '^([0-9]+)/([0-9]+)$' ]] && (( match[2] > 0 && match[1] * 100 < match[2] * 25 )); then
+  NETWARN=" | P2P偏低 ${P2P}"
+fi
+
+case "$STATE" in
+ TRAINING) STATUS=up; MSG="🟢 真实训练 | TRAINING | ${RUNINFO} | ${DETAIL} | ${ATXT} | CPU ${CPU}% | P2P ${P2P:-待更新}${NETWARN} | 日志${AGE}秒" ;;
+ MERGING) STATUS=up; MSG="🟡 合并阶段 | MERGING | ${RUNINFO} | 当前没有训练计算属正常 | ${ATXT} | 日志${AGE}秒" ;;
+ SYNCING) STATUS=up; MSG="🟡 权重同步 | SYNCING | ${RUNINFO} | 正在上传/下载/设置模型权重${NETWARN} | CPU ${CPU}% | 日志${AGE}秒" ;;
+ RUN_IDLE) STATUS=up; MSG="🟠 池内等待 | RUN_IDLE | ${RUNINFO} | 已在Run但近期无有效计算 | ${ATXT}${NETWARN} | CPU ${CPU}% | 日志${AGE}秒" ;;
+ INITIALIZING) STATUS=up; MSG="🟠 训练池初始化 | INITIALIZING | ${RUNINFO} | 尚未出现有效计算 | 日志${AGE}秒" ;;
+ CONFIRMED) STATUS=up; MSG="🔵 已到队首确认 | CONFIRMED | 服务端已确认，尚未分配Run | 日志${AGE}秒" ;;
+ PROCESSING) STATUS=up; MSG="🟠 注册处理中 | PROCESSING | 正在验证设备并分配Run | 日志${AGE}秒" ;;
+ REG_FAILED) STATUS=down; MSG="🔴 注册确认失败 | REG_FAILED${REGERROR:+ | ${REGERROR}} | 客户端通常会自动重新排队 | 日志${AGE}秒" ;;
+ QUEUED) STATUS=up; MSG="🔵 正常排队 | QUEUED${POS:+ | 位置${POS}} | 已排${QTXT:-0分钟} | 尚未训练${WARN} | 日志${AGE}秒" ;;
+ RESETTING) STATUS=down; MSG="🔴 注册被重置 | RESETTING | 已失去Run注册，等待重新排队 | 日志${AGE}秒" ;;
+ CRASHED) STATUS=down; MSG="🔴 程序崩溃 | CRASHED | miner异常退出 | 日志${AGE}秒" ;;
+ STOPPED) STATUS=down; MSG="🔴 IOTA停止 | STOPPED | 请点击 Start training | 日志${AGE}秒" ;;
+ *) STATUS=down; MSG="🔴 状态未确认 | UNKNOWN | 进程存在但没有可确认状态 | CPU ${CPU}% | 日志${AGE}秒" ;;
+esac
+
+# Keep the reset warning visible while live queue details continue to refresh.
+if [[ -s "$RESTART_LATCH" ]]; then
+  ALERT_TS=$(cut -f1 "$RESTART_LATCH" 2>/dev/null || echo 0)
+  ALERT_WHEN=$(/bin/date -r "${ALERT_TS:-0}" '+%m-%d %H:%M' 2>/dev/null || echo "时间待更新")
+  LIVE="当前状态${STATE}"
+  [[ "$STATE" == QUEUED ]] && LIVE="当前已重新排队${POS:+，位置${POS}}"
+  [[ "$STATE" == CONFIRMED ]] && LIVE="当前已到队首确认"
+  [[ "$STATE" == PROCESSING ]] && LIVE="当前注册处理中"
+  STATE=RESTART_REQUIRED
+  STATUS=down
+  MSG="🔴 训练中途被重置 | RESTART_REQUIRED | ${ALERT_WHEN}出现缓存测速界面 | ${LIVE} | 建议手动重启；若自动恢复真实训练将解除 | 日志${AGE}秒"
+fi
+((D<90)) || { STATUS=down; MSG="🔴 磁盘严重不足 | ${D}% | $MSG"; }
+MSG="$MSG | 今日Run ${RUNTODAY} · 累计${RUNTOTAL}${POOLTXT}${REWARDTXT}"
+finish "$STATE" "$STATUS" "$MSG" "$AGE" "$POS" "$ACTIVEAGE"
+MONITOR
+
+cat > "$STAGE/cleanup.sh" <<'CLEANUP'
+#!/bin/zsh
+set -u
+BASE="$HOME/.iota-guardian"; LOGDIR="$HOME/Library/Logs/IOTA Train at Home"; NOW=$(date '+%Y-%m-%d %H:%M:%S')
+B=$(du -sk "$LOGDIR" 2>/dev/null|awk '{print $1}'); B=${B:-0}
+find "$LOGDIR" -type f \( -name '*.log' -o -name '*.txt' -o -name '*.gz' \) -mtime +14 -delete 2>/dev/null || true
+find "$HOME/Library/Logs/DiagnosticReports" -type f \( -iname '*iota*' -o -iname '*main_pool*' \) -mtime +30 -delete 2>/dev/null || true
+A=$(du -sk "$LOGDIR" 2>/dev/null|awk '{print $1}'); A=${A:-0}; F=$((B-A)); ((F<0))&&F=0
+echo "$NOW | IOTA日志 ${B}KB→${A}KB | 释放${F}KB" >> "$BASE/cleanup.log"
+tail -n 300 "$BASE/cleanup.log" > "$BASE/cleanup.log.tmp" 2>/dev/null && mv "$BASE/cleanup.log.tmp" "$BASE/cleanup.log"
+CLEANUP
+
+cat > "$STAGE/daily_report.sh" <<'REPORT'
+#!/bin/zsh
+BASE="$HOME/.iota-guardian"; TODAY=$(date '+%Y-%m-%d'); S="$BASE/samples-$TODAY.csv"; R="$BASE/reports/$TODAY.txt"; mkdir -p "$BASE/reports"
+count(){ grep -c ",\"$1\"," "$S" 2>/dev/null || true; }
+TRAIN=$(count TRAINING); MERGE=$(count MERGING); SYNC=$(count SYNCING)
+TOTAL=$(awk 'END{print (NR>0 ? NR-1 : 0)}' "$S" 2>/dev/null); TOTAL=${TOTAL:-0}
+PRODUCTIVE=$((TRAIN+MERGE+SYNC)); RATE=0; ((TOTAL>0)) && RATE=$((PRODUCTIVE*100/TOTAL))
+RUNSTATS=$(/usr/bin/python3 "$BASE/run_tracker.py" "" 2>/dev/null || print -r -- $'0\t0')
+IFS=$'\t' read -r RUNTODAY RUNTOTAL <<< "$RUNSTATS"
+POOL=$(cat "$BASE/run_pool_summary.tsv" 2>/dev/null || true)
+POOLL="暂无"
+if [[ -n "$POOL" ]]; then
+  IFS=$'\t' read -r PT PA PALL PU PC PF PD <<< "$POOL"
+  POOLL="活跃${PA}个"
+  [[ "$PU" != "-" && "$PC" != "-" ]] && POOLL="${POOLL}，已用${PU}/${PC}"
+  [[ "$PF" != "-" ]] && POOLL="${POOLL}，空位${PF}"
+fi
+REWARDL="待识别hotkey或官方接口暂不可用"
+if [[ -s "$BASE/reward_summary.tsv" ]]; then
+  IFS=$'\t' read -r RT RH RE RP RPN RF RM RDAY RWEEK RAVG RLAST RLASTT RSTATUS < "$BASE/reward_summary.tsv"
+  REWARDL="累计${RE} α，今日结算+${RDAY}，7日合计${RWEEK}，7日均值${RAVG}/日，已支付${RP}，待支付${RPN}，冻结${RF}"
+fi
+cat > "$R" <<EOF2
+IOTA Guardian V6.5.1 每日报告
+日期：$TODAY
+电脑：$(cat "$BASE/node_name" 2>/dev/null)
+本机参与Run：今日 ${RUNTODAY:-0} 个 / 累计 ${RUNTOTAL:-0} 个
+官方Run池：$POOLL
+官方收益：$REWARDL
+真实训练：约 $TRAIN 分钟
+合并阶段：约 $MERGE 分钟
+权重同步：约 $SYNC 分钟
+有效在线占比：约 ${RATE}%（训练+合并+权重同步 / 当日监控样本）
+池内等待：约 $(count RUN_IDLE) 分钟
+排队：约 $(count QUEUED) 分钟
+注册阶段：CONFIRMED $(count CONFIRMED) / PROCESSING $(count PROCESSING) / REG_FAILED $(count REG_FAILED) 分钟
+故障：RESTART_REQUIRED $(count RESTART_REQUIRED) / RESETTING $(count RESETTING) / CRASHED $(count CRASHED) / STOPPED $(count STOPPED) / STALE $(count STALE) 分钟
+当前：$(cat "$BASE/current_message" 2>/dev/null)
+EOF2
+find "$BASE/reports" -type f -mtime +31 -delete 2>/dev/null || true
+REPORT
+
+cat > "$STAGE/show_report.sh" <<'SHOW'
+#!/bin/zsh
+BASE="$HOME/.iota-guardian"
+echo "===== IOTA Guardian V6.5.1 Run与收益增强版 ====="
+echo "版本：$(cat "$BASE/version" 2>/dev/null)"
+echo "电脑：$(cat "$BASE/node_name" 2>/dev/null)"
+echo "当前：$(cat "$BASE/current_message" 2>/dev/null)"
+echo "Run统计：$(/usr/bin/python3 "$BASE/run_tracker.py" "" 2>/dev/null | awk -F '\t' '{print "今日"$1"个 / 累计"$2"个"}')"
+echo "官方Run池：$(awk -F '\t' '{s="活跃"$2"个"; if($4!="-"&&$5!="-")s=s"，已用"$4"/"$5; if($6!="-")s=s"，空位"$6; print s}' "$BASE/run_pool_summary.tsv" 2>/dev/null || echo "暂未取得")"
+echo "官方收益：$(awk -F '\t' '{print "累计"$3" α，今日结算+"$8"，7日均值"$10"/日，已支付"$4"，待支付"$5"，冻结"$6}' "$BASE/reward_summary.tsv" 2>/dev/null || echo "暂未取得")"
+echo "最近状态变化："; tail -n 15 "$BASE/events.csv" 2>/dev/null
+echo; "$BASE/show_runs.sh" 2>/dev/null || true
+SHOW
+
+for item in monitor.sh runs_refresh.sh rewards_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do chmod 700 "$STAGE/$item"; done
+chmod 700 "$STAGE/status_engine.py" "$STAGE/dashboard.py" "$STAGE/runs_view.py" "$STAGE/run_tracker.py" "$STAGE/reward_tracker.py"
+/usr/bin/python3 -m py_compile "$STAGE/status_engine.py"
+/usr/bin/python3 -m py_compile "$STAGE/dashboard.py"
+/usr/bin/python3 -m py_compile "$STAGE/runs_view.py"
+/usr/bin/python3 -m py_compile "$STAGE/run_tracker.py"
+/usr/bin/python3 -m py_compile "$STAGE/reward_tracker.py"
+
+make_plist(){
+  local label="$1" script="$2" schedule="$3"
+  cat > "$STAGE/$label.plist" <<EOF2
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>$label</string><key>ProgramArguments</key><array><string>/bin/zsh</string><string>$BASE/$script</string></array>$schedule<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>$BASE/${script%.sh}-error.log</string></dict></plist>
+EOF2
+}
+make_plist "$MONITOR_LABEL" monitor.sh '<key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>'
+make_plist "$CLEAN_LABEL" cleanup.sh '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>20</integer></dict>'
+make_plist "$REPORT_LABEL" daily_report.sh '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>55</integer></dict>'
+make_plist "$POOL_LABEL" runs_refresh.sh '<key>RunAtLoad</key><true/><key>StartInterval</key><integer>600</integer>'
+make_plist "$REWARD_LABEL" rewards_refresh.sh '<key>RunAtLoad</key><true/><key>StartInterval</key><integer>3600</integer>'
+for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL" "$REWARD_LABEL"; do plutil -lint "$STAGE/$label.plist" >/dev/null; done
+
+# 仅停用本系列旧监控，不碰 IOTA、钱包、hotkey 或第三方 hub agent。
+for plist in "$LAUNCH"/com.baibai.iota-log-monitor.plist "$LAUNCH"/com.baibai.iota-guardian*.plist; do
+  [[ -f "$plist" ]] || continue
+  old_label=$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist" 2>/dev/null || echo '')
+  [[ -n "$old_label" && "$old_label" == "${${plist:t}%.plist}" ]] || { echo "旧监控标签不匹配，停止安装：$plist"; exit 1; }
+  launchctl print "$GUI_DOMAIN/$old_label" >/dev/null 2>&1 && launchctl bootout "$GUI_DOMAIN/$old_label"
+  mv "$plist" "$BACKUP/LaunchAgents/"
+done
+for item in monitor.sh status_engine.py dashboard.py runs_view.py run_tracker.py reward_tracker.py runs_refresh.sh rewards_refresh.sh show_monitor.sh show_runs.sh cleanup.sh daily_report.sh show_report.sh; do /usr/bin/install -m 700 "$STAGE/$item" "$BASE/$item"; done
+for item in node_name push_url version; do /usr/bin/install -m 600 "$STAGE/$item" "$BASE/$item"; done
+for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL" "$REWARD_LABEL"; do /usr/bin/install -m 600 "$STAGE/$label.plist" "$LAUNCH/$label.plist"; launchctl bootstrap "$GUI_DOMAIN" "$LAUNCH/$label.plist"; done
+mv "$STAGE" "$BACKUP/staged-install"; trap - ZERR
+
+echo
+echo "✅ IOTA Guardian V6.5.1 安装/升级完成"
+echo "电脑：$(cat "$BASE/node_name")"
+echo "60秒检测一次；日志超过180秒才判定 STALE。"
+echo "TRAINING=真实计算；MERGING=合并；SYNCING=权重同步；CONFIRMED/PROCESSING=注册中；QUEUED=排队。"
+echo "RESTART_REQUIRED=训练中途重置后出现缓存测速；人工重启或恢复真实训练后自动解除。"
+echo "查看全部 Run 池：$BASE/show_runs.sh"
+echo "打开本机实时仪表盘：$BASE/show_monitor.sh"
+echo "官方 Run 池每10分钟刷新；官方收益每60分钟刷新。"
+echo "收益只读取公开 hotkey 的官方 entitlement，不读取钱包、助记词或私钥。"
+echo "终端和 Kuma 同时显示今日/累计参与 Run 数及官方结算收益。"
+echo "本工具不会启动、停止、重启或点击 IOTA，也不会修改钱包和 miner。"
+echo "请等待约60秒后查看 Uptime Kuma。"
+\t'"$NOWTXT" > "$RESTART_LATCH"
   fi
 fi
 ALERT_TS=$(cut -f1 "$RESTART_LATCH" 2>/dev/null || echo 0)
