@@ -886,7 +886,7 @@ echo "RESTART_REQUIRED=训练中途重置后出现缓存测速；人工重启或
 echo "查看全部 Run 池：$BASE/show_runs.sh"
 echo "打开本机实时仪表盘：$BASE/show_monitor.sh"
 echo "官方 Run 池每10分钟刷新。"
-echo "本版本不采集、不保存、不显示收益数据。"
+echo "本版本不再采集或显示收益数据；旧数据仅保留在升级备份中，不参与监控。"
 echo "终端和 Kuma 同时显示今日/累计参与 Run 数。"
 echo "本工具不会启动、停止、重启或点击 IOTA，也不会修改钱包和 miner。"
 echo "请等待约60秒后查看 Uptime Kuma。"
