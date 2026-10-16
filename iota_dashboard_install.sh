@@ -150,13 +150,16 @@ def render_page(rows, error):
     )
     body_rows = []
     for row in rows:
-        searchable = html.escape((row["name"] + " " + row["message"]).lower(), quote=True)
+        display_message = row["message"]
+        if row["state"] == "ready":
+            display_message = re.sub(r"^[🔵🩵]\s*(?:已到队首确认|准备开跑)", "🩵 准备开跑", display_message, count=1)
+        searchable = html.escape((row["name"] + " " + display_message).lower(), quote=True)
         body_rows.append(
             f'<tr class="machine {row["state"]}" data-state="{row["state"]}" data-search="{searchable}">'
             f'<td class="name">{html.escape(row["name"])}</td>'
             f'<td><span class="badge {row["state"]}">{html.escape(row["label"])}</span></td>'
             f'<td class="age">{html.escape(age_text(row["age"]))}</td>'
-            f'<td class="message">{html.escape(row["message"])}</td></tr>'
+            f'<td class="message">{html.escape(display_message)}</td></tr>'
         )
     error_html = f'<div class="db-error">数据库读取失败：{html.escape(error)}</div>' if error else ""
     return f'''<!doctype html>
