@@ -3,13 +3,13 @@ set -euo pipefail
 setopt null_glob
 umask 077
 
-# IOTA Guardian V6.5.2：精准状态、官方 Run、参与 Run 统计与本机实时仪表盘。
+# IOTA Guardian V6.5.3：精准状态、官方 Run、参与 Run 统计与本机实时仪表盘。
 [[ "$(uname -s)" == Darwin ]] || { echo "本脚本仅支持 macOS。"; exit 1; }
 [[ "$(id -u)" != 0 ]] || { echo "请使用当前登录用户运行，不要使用 sudo。"; exit 1; }
 GUI_DOMAIN="gui/$(id -u)"
 launchctl print "$GUI_DOMAIN" >/dev/null 2>&1 || { echo "请在已登录桌面的 Mac 终端运行。"; exit 1; }
 
-VERSION="6.5.2"
+VERSION="6.5.3"
 BASE="$HOME/.iota-guardian"
 LAUNCH="$HOME/Library/LaunchAgents"
 MONITOR_LABEL="com.baibai.iota-guardian-v6.monitor"
@@ -26,7 +26,7 @@ done
 trap 'echo "安装未完成。备份：$BACKUP；请保留此目录，勿上传（含 Push URL）。" >&2' ZERR
 
 echo "=============================================="
-echo " IOTA Guardian V6.5.2 精准状态与Run增强版"
+echo " IOTA Guardian V6.5.3 精准状态与Run增强版"
 echo "=============================================="
 echo "只监控、记录、告警和清理旧日志，不控制或重启 IOTA。"
 echo
@@ -255,7 +255,7 @@ REFRESH = 10
 LABELS = {
     "TRAINING": ("🟢", "真实训练"), "MERGING": ("🟡", "合并阶段"),
     "SYNCING": ("🟡", "权重同步"), "RUN_IDLE": ("🟠", "池内等待"),
-    "INITIALIZING": ("🟠", "训练池初始化"), "CONFIRMED": ("🔵", "已到队首确认"),
+    "INITIALIZING": ("🟠", "训练池初始化"), "CONFIRMED": ("🩵", "准备开跑"),
     "PROCESSING": ("🟠", "注册处理中"), "REG_FAILED": ("🔴", "注册确认失败"),
     "QUEUED": ("🔵", "正常排队"), "RESETTING": ("🔴", "注册被重置"),
     "RESTART_REQUIRED": ("🔴", "训练中途被重置，建议人工重启"),
@@ -436,7 +436,7 @@ URLS = (
 RUN_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(?:-[A-Za-z0-9_-]+)?$")
 
 def fetch(url):
-    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.5.2", "Accept": "application/json"})
+    req = Request(url, headers={"User-Agent": "IOTA-Guardian/6.5.3", "Accept": "application/json"})
     with urlopen(req, timeout=12) as res:
         body = res.read()
         if res.headers.get("Content-Encoding", "").lower() == "gzip" or body[:2] == b"\x1f\x8b":
@@ -753,7 +753,7 @@ case "$STATE" in
  SYNCING) STATUS=up; MSG="🟡 权重同步 | SYNCING | ${RUNINFO} | 正在上传/下载/设置模型权重${NETWARN} | CPU ${CPU}% | 日志${AGE}秒" ;;
  RUN_IDLE) STATUS=up; MSG="🟠 池内等待 | RUN_IDLE | ${RUNINFO} | 已在Run但近期无有效计算 | ${ATXT}${NETWARN} | CPU ${CPU}% | 日志${AGE}秒" ;;
  INITIALIZING) STATUS=up; MSG="🟠 训练池初始化 | INITIALIZING | ${RUNINFO} | 尚未出现有效计算 | 日志${AGE}秒" ;;
- CONFIRMED) STATUS=up; MSG="🔵 已到队首确认 | CONFIRMED | 服务端已确认，尚未分配Run | 日志${AGE}秒" ;;
+ CONFIRMED) STATUS=up; MSG="🩵 准备开跑 | CONFIRMED | 服务端已确认，尚未分配Run | 日志${AGE}秒" ;;
  PROCESSING) STATUS=up; MSG="🟠 注册处理中 | PROCESSING | 正在验证设备并分配Run | 日志${AGE}秒" ;;
  REG_FAILED) STATUS=down; MSG="🔴 注册确认失败 | REG_FAILED${REGERROR:+ | ${REGERROR}} | 客户端通常会自动重新排队 | 日志${AGE}秒" ;;
  QUEUED) STATUS=up; MSG="🔵 正常排队 | QUEUED${POS:+ | 位置${POS}} | 已排${QTXT:-0分钟} | 尚未训练${WARN} | 日志${AGE}秒" ;;
@@ -810,7 +810,7 @@ if [[ -n "$POOL" ]]; then
   [[ "$PF" != "-" ]] && POOLL="${POOLL}，空位${PF}"
 fi
 cat > "$R" <<EOF2
-IOTA Guardian V6.5.2 每日报告
+IOTA Guardian V6.5.3 每日报告
 日期：$TODAY
 电脑：$(cat "$BASE/node_name" 2>/dev/null)
 本机参与Run：今日 ${RUNTODAY:-0} 个 / 累计 ${RUNTOTAL:-0} 个
@@ -831,7 +831,7 @@ REPORT
 cat > "$STAGE/show_report.sh" <<'SHOW'
 #!/bin/zsh
 BASE="$HOME/.iota-guardian"
-echo "===== IOTA Guardian V6.5.2 精准状态与Run增强版 ====="
+echo "===== IOTA Guardian V6.5.3 精准状态与Run增强版 ====="
 echo "版本：$(cat "$BASE/version" 2>/dev/null)"
 echo "电脑：$(cat "$BASE/node_name" 2>/dev/null)"
 echo "当前：$(cat "$BASE/current_message" 2>/dev/null)"
@@ -878,7 +878,7 @@ for label in "$MONITOR_LABEL" "$CLEAN_LABEL" "$REPORT_LABEL" "$POOL_LABEL"; do /
 mv "$STAGE" "$BACKUP/staged-install"; trap - ZERR
 
 echo
-echo "✅ IOTA Guardian V6.5.2 安装/升级完成"
+echo "✅ IOTA Guardian V6.5.3 安装/升级完成"
 echo "电脑：$(cat "$BASE/node_name")"
 echo "60秒检测一次；日志超过180秒才判定 STALE。"
 echo "TRAINING=真实计算；MERGING=合并；SYNCING=权重同步；CONFIRMED/PROCESSING=注册中；QUEUED=排队。"
