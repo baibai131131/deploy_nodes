@@ -252,7 +252,8 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now iota-training-dashboard.service
+systemctl enable iota-training-dashboard.service >/dev/null
+systemctl restart iota-training-dashboard.service
 sleep 2
 
 if ! curl -fsS http://127.0.0.1:3002/health >/dev/null; then
