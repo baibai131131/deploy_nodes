@@ -4,6 +4,7 @@ import http.client
 import os
 from pathlib import Path
 import socket
+import ssl
 import subprocess
 import tempfile
 import time
@@ -132,9 +133,60 @@ write_client_files
                 self.assertIn("ProtectSystem=strict", unit)
                 self.assertNotIn("User=root", unit)
 
+    def test_cleanup_targets_only_own_journal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "managed-by").write_text("iota-dual-test-v1\n")
+            result = bash('''
+BASE="$TEST_DIR"
+require_root() { :; }
+journalctl() { printf 'JOURNAL %s\n' "$*"; }
+maintain_server
+''', TEST_DIR=temp)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            commands = [line for line in result.stdout.splitlines() if line.startswith("JOURNAL ")]
+            self.assertEqual(len(commands), 2)
+            self.assertTrue(all("--namespace=iota-dual" in command for command in commands))
+            self.assertTrue(any("--vacuum-time=7d" in command for command in commands))
+
+    def test_maintenance_configuration_and_no_proxy_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "units").mkdir()
+            for unit in ["hy2", "reality"]:
+                (root / f"units/iota-dual-{unit}.service").touch()
+            result = bash('''
+BASE="$TEST_DIR"
+UNIT_DIR="$TEST_DIR/units"
+JOURNAL_CONFIG="$TEST_DIR/journal/limits.conf"
+systemctl() { printf 'SYSTEMCTL %s\n' "$*"; }
+setup_maintenance
+''', TEST_DIR=temp)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("restart", "\n".join(line for line in result.stdout.splitlines() if line.startswith("SYSTEMCTL ")))
+            limits = (root / "journal/limits.conf").read_text()
+            self.assertIn("SystemMaxUse=100M", limits)
+            self.assertIn("MaxRetentionSec=7day", limits)
+            for unit in ["hy2", "reality"]:
+                self.assertIn("LogNamespace=iota-dual", (root / f"units/iota-dual-{unit}.service.d/20-iota-journal.conf").read_text())
+
+    def test_no_destructive_cache_or_connection_commands(self):
+        content = SCRIPT.read_text()
+        for forbidden in ["/proc/sys/vm/drop_caches", "conntrack -F", "iptables -F", "swapoff", "apt-get autoremove"]:
+            self.assertNotIn(forbidden, content)
+
+    def test_certbot_and_renewal_are_isolated(self):
+        content = SCRIPT.read_text()
+        self.assertIn('--required-profile shortlived --ip-address "$PUBLIC_IP"', content)
+        self.assertIn('"$BASE/acme-venv/bin/certbot" renew', content)
+        self.assertIn('--config-dir "$BASE/acme/config"', content)
+        self.assertIn('--no-cache-dir', content)
+        self.assertNotIn('url = "http://', content)
+        self.assertIn('url = "https://$PUBLIC_IP', content)
+        self.assertNotIn('curl -k', content)
+
 
 class SubscriptionTests(unittest.TestCase):
-    """Real loopback HTTP tests; do not bind publicly or invoke systemd."""
+    """Real loopback HTTPS tests; test CA only, no external ACME or systemd."""
 
     @classmethod
     def setUpClass(cls):
@@ -147,6 +199,13 @@ class SubscriptionTests(unittest.TestCase):
             raise RuntimeError(result.stderr)
         cls.program = cls.root / "subscription_server.py"
         compile(cls.program.read_text(), str(cls.program), "exec")
+        subprocess.run([
+            "openssl", "req", "-x509", "-nodes", "-newkey", "ec",
+            "-pkeyopt", "ec_paramgen_curve:P-256", "-days", "1",
+            "-keyout", str(cls.root / "server.key"), "-out", str(cls.root / "server.crt"),
+            "-subj", "/CN=IOTA local test only", "-addext", "subjectAltName=IP:127.0.0.1",
+        ], check=True, capture_output=True)
+        cls.context = ssl.create_default_context(cafile=str(cls.root / "server.crt"))
         (cls.root / "clash.yaml").write_bytes(cls.payload)
         cls.port, cls.process = cls.launch(cls.root, time.time() + 60)
         for _ in range(100):
@@ -172,9 +231,12 @@ class SubscriptionTests(unittest.TestCase):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        state = {"public_ip": "8.8.8.8", "port": port,
+        state = {"scheme": "https", "public_ip": "8.8.8.8", "port": port,
                  "expires_at": int(expires), "token": cls.token}
         (directory / "state.json").write_text(json.dumps(state))
+        if directory != cls.root:
+            (directory / "server.crt").write_bytes((cls.root / "server.crt").read_bytes())
+            (directory / "server.key").write_bytes((cls.root / "server.key").read_bytes())
         process = subprocess.Popen(
             ["python3", str(cls.program), str(directory), "--bind", "127.0.0.1"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -183,7 +245,7 @@ class SubscriptionTests(unittest.TestCase):
 
     @classmethod
     def request(cls, path, method="GET", port=None):
-        connection = http.client.HTTPConnection("127.0.0.1", port or cls.port, timeout=2)
+        connection = http.client.HTTPSConnection("127.0.0.1", port or cls.port, timeout=2, context=cls.context)
         try:
             connection.request(method, path)
             response = connection.getresponse()
@@ -217,6 +279,29 @@ class SubscriptionTests(unittest.TestCase):
 
     def test_no_upload_method(self):
         self.assertEqual(self.request(f"/{self.token}/clash.yaml", "POST")[0], 501)
+
+    def test_plain_http_cannot_download(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        try:
+            with self.assertRaises((OSError, http.client.HTTPException)):
+                connection.request("GET", f"/{self.token}/clash.yaml")
+                connection.getresponse()
+        finally:
+            connection.close()
+
+    def test_untrusted_certificate_is_rejected(self):
+        connection = http.client.HTTPSConnection("127.0.0.1", self.port, timeout=2,
+                                                context=ssl.create_default_context())
+        try:
+            with self.assertRaises(ssl.SSLCertVerificationError):
+                connection.request("GET", f"/{self.token}/clash.yaml")
+        finally:
+            connection.close()
+
+    def test_wrong_server_ip_is_rejected(self):
+        with socket.create_connection(("127.0.0.1", self.port), timeout=2) as raw:
+            with self.assertRaises(ssl.SSLCertVerificationError):
+                self.context.wrap_socket(raw, server_hostname="8.8.8.8")
 
     def test_multiple_imports(self):
         with ThreadPoolExecutor(max_workers=8) as executor:
