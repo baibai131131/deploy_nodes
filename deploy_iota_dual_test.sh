@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # IOTA dual-protocol test VPS: Hysteria2/UDP + VLESS-REALITY/TCP.
-# No Docker, web panel, or third-party monitor. Short-lived HTTP subscription.
+# No Docker, web panel, or third-party monitor. Verified HTTPS subscription.
 # Fresh Ubuntu 22.04/24.04; amd64/arm64. English terminal output.
 set -Eeuo pipefail
 umask 077
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 HY_VERSION="2.13.0"
 XR_VERSION="26.10.31"
+CERTBOT_VERSION="5.9.0"
 BASE="/opt/iota-dual"
 UNIT_DIR="/etc/systemd/system"
 MARKER="iota-dual-test-v1"
@@ -15,6 +16,7 @@ EXPORT_YAML="/root/IOTA-DUAL.yaml"
 EXPORT_INFO="/root/IOTA-DUAL.txt"
 CONTROL="/usr/local/sbin/iota-dual"
 SYSCTL_FILE="/etc/sysctl.d/90-iota-dual-udp.conf"
+JOURNAL_CONFIG="/etc/systemd/journald@iota-dual.conf.d/limits.conf"
 TEMP_DIR=""
 INSTALL_STARTED=0
 INSTALL_DONE=0
@@ -102,7 +104,9 @@ check_fresh_server() {
   local candidate
   for candidate in "$BASE" "$CONTROL" "$EXPORT_YAML" "$EXPORT_INFO" "$SYSCTL_FILE" \
     "$UNIT_DIR/iota-dual-hy2.service" "$UNIT_DIR/iota-dual-reality.service" \
-    "$UNIT_DIR/iota-dual-subscription.service"; do
+    "$UNIT_DIR/iota-dual-subscription.service" "$UNIT_DIR/iota-dual-maintain.service" \
+    "$UNIT_DIR/iota-dual-maintain.timer" "$UNIT_DIR/iota-dual-renew.service" \
+    "$UNIT_DIR/iota-dual-renew.timer" "$JOURNAL_CONFIG"; do
     [[ ! -e "$candidate" && ! -L "$candidate" ]] || die "Existing file: $candidate. No files were overwritten."
   done
   # Do not stop, remove, or overwrite an existing proxy/panel.
@@ -112,6 +116,7 @@ check_fresh_server() {
   port_in_use udp "$HY_PORT" && die "UDP/$HY_PORT is occupied; no services were stopped."
   port_in_use tcp "$REALITY_PORT" && die "TCP/$REALITY_PORT is occupied; no services were stopped."
   port_in_use tcp "$SUB_PORT" && die "TCP/$SUB_PORT is occupied; subscription port is not available."
+  port_in_use tcp 80 && die "TCP/80 is occupied. IP certificate validation needs this port; nothing was stopped."
   if getent passwd iota-dual >/dev/null || getent group iota-dual >/dev/null; then
     die "The iota-dual account/group already exists. Refusing to reuse it."
   fi
@@ -330,8 +335,9 @@ Two protocols on one VPS do NOT protect against VPS/IP/network outages.
 Status:      iota-dual status
 Show config: iota-dual show
 New URL:     iota-dual subscribe
-HY2 log:     journalctl -u iota-dual-hy2 -f
-REALITY log: journalctl -u iota-dual-reality -f
+Diagnose:    iota-dual diagnose
+HY2 log:     journalctl --namespace='*' -u iota-dual-hy2 -f
+REALITY log: journalctl --namespace='*' -u iota-dual-reality -f
 Uninstall:   iota-dual uninstall
 EOF
   chmod 600 "$EXPORT_YAML" "$EXPORT_INFO"
@@ -340,9 +346,9 @@ EOF
 write_subscription_program() {
   cat >"$BASE/subscription_server.py" <<'PY'
 #!/usr/bin/env python3
-"""Serve exactly one token-protected YAML file, until its fixed expiry time.
+"""Serve exactly one token-protected YAML file over TLS until fixed expiry.
 
-This is HTTP, not HTTPS: the random path is a bearer secret, NOT encryption.
+TLS is mandatory; a certificate failure never falls back to plaintext HTTP.
 No directory listing, arbitrary file paths, access logs, uploads, or redirects.
 """
 import argparse
@@ -350,6 +356,7 @@ import hmac
 import json
 from pathlib import Path
 import re
+import ssl
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -437,6 +444,12 @@ def serve(directory, bind):
             pass  # Do not log request context or tokens on malformed requests.
 
     with Server((bind, port), Handler) as server:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(root / "server.crt", root / "server.key")
+        # Defer per-client handshakes to workers; never block the accept loop.
+        server.socket = context.wrap_socket(server.socket, server_side=True,
+                                            do_handshake_on_connect=False)
         server.timeout = 1
         while time.time() < expires_at:
             server.handle_request()
@@ -455,7 +468,7 @@ PY
 write_subscription_unit() {
   cat >"$UNIT_DIR/iota-dual-subscription.service" <<EOF
 [Unit]
-Description=IOTA short-lived private-path HTTP subscription
+Description=IOTA short-lived verified HTTPS subscription
 After=network-online.target
 Wants=network-online.target
 
@@ -479,6 +492,7 @@ RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 StandardOutput=null
 StandardError=journal
+LogNamespace=iota-dual
 EOF
   chmod 644 "$UNIT_DIR/iota-dual-subscription.service"
 }
@@ -488,16 +502,204 @@ show_subscription_link() {
   python3 - "$BASE/subscription/state.json" <<'PY'
 import datetime, json, sys, time
 state = json.load(open(sys.argv[1], encoding="utf-8"))
-if time.time() >= state["expires_at"]:
+if state.get("scheme") != "https":
+    print("Legacy HTTP URL disabled. Upgrade and run: iota-dual subscribe")
+elif time.time() >= state["expires_at"]:
     print("Subscription URL expired. Run: iota-dual subscribe")
 else:
     print("\n===== COPY THIS CLASH SUBSCRIPTION URL =====")
-    print(f'http://{state["public_ip"]}:{state["port"]}/{state["token"]}/clash.yaml')
+    print(f'https://{state["public_ip"]}:{state["port"]}/{state["token"]}/clash.yaml')
     expiry = datetime.datetime.fromtimestamp(state["expires_at"], datetime.timezone.utc)
     print("Expires:", expiry.isoformat())
-    print("HTTP IS NOT ENCRYPTED. Keep this URL private; prefer SSH/SFTP or HTTPS on untrusted networks.")
+    print("HTTPS with a publicly trusted IP certificate. Never disable client certificate verification.")
+    print("Keep this bearer URL private. Possession of it permits downloading node credentials.")
     print("Imported proxy nodes continue working after the subscription URL expires.")
 PY
+}
+
+open_managed_ufw_port() {
+  local specification=$1
+  if command -v ufw >/dev/null && LC_ALL=C ufw status | grep -q '^Status: active'; then
+    if ! LC_ALL=C ufw status | awk '{print $1, $2}' | grep -Fxq "$specification ALLOW"; then
+      ufw allow "$specification" comment 'iota-dual-test'
+      printf '%s\n' "$specification" >>"$BASE/ufw-added"
+    fi
+  fi
+}
+
+copy_subscription_certificate() {
+  require_root
+  managed_install || die "No managed installation found."
+  local source_dir="$BASE/acme/config/live/iota-dual-ip"
+  [[ -f "$source_dir/fullchain.pem" && -f "$source_dir/privkey.pem" ]] || die "Subscription certificate missing."
+  [[ -d "$BASE/subscription" && ! -L "$BASE/subscription" ]] || die "Subscription directory missing or invalid."
+  install -m 640 -o root -g iota-dual-sub "$source_dir/fullchain.pem" "$BASE/subscription/server.crt"
+  install -m 640 -o root -g iota-dual-sub "$source_dir/privkey.pem" "$BASE/subscription/server.key"
+  # Reload only the download server if it is currently in its active TTL window.
+  if systemctl is-active --quiet iota-dual-subscription.service; then
+    systemctl restart iota-dual-subscription.service
+  fi
+}
+
+ensure_subscription_certificate() {
+  local live="$BASE/acme/config/live/iota-dual-ip" certbot="$BASE/acme-venv/bin/certbot"
+  if [[ -f "$live/cert.pem" ]] &&
+     openssl x509 -in "$live/cert.pem" -noout -checkip "$PUBLIC_IP" >/dev/null 2>&1 &&
+     openssl x509 -in "$live/cert.pem" -noout -checkend 86400 >/dev/null 2>&1; then
+    copy_subscription_certificate
+    return
+  fi
+  port_in_use tcp 80 && die "TCP/80 is occupied. Certificate validation cannot start; no HTTP fallback will be opened."
+  open_managed_ufw_port 80/tcp
+  if [[ ! -x "$certbot" ]]; then
+    log "Install isolated official Certbot ${CERTBOT_VERSION}; no pip cache or system Certbot changes."
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv
+    python3 -m venv "$BASE/acme-venv"
+    "$BASE/acme-venv/bin/python" -m pip install --no-cache-dir --index-url https://pypi.org/simple "certbot==${CERTBOT_VERSION}"
+  fi
+  install -d -m 700 "$BASE/acme" "$BASE/acme/config" "$BASE/acme/work" "$BASE/acme/logs"
+  log "Request a trusted Let's Encrypt IP certificate. Inbound TCP/80 must reach this VPS."
+  log "This registers an ACME account and accepts the Let's Encrypt subscriber agreement."
+  if ! "$certbot" certonly --standalone --preferred-challenges http --http-01-address 0.0.0.0 \
+    --non-interactive --agree-tos --register-unsafely-without-email \
+    --server https://acme-v02.api.letsencrypt.org/directory \
+    --required-profile shortlived --ip-address "$PUBLIC_IP" \
+    --cert-name iota-dual-ip --keep-until-expiring --key-type ecdsa \
+    --config-dir "$BASE/acme/config" --work-dir "$BASE/acme/work" \
+    --logs-dir "$BASE/acme/logs" --max-log-backups 7; then
+    die "IP certificate issuance failed. Proxy services were not stopped. No plaintext subscription was opened; check TCP/80 and retry iota-dual subscribe."
+  fi
+  openssl x509 -in "$live/cert.pem" -noout -checkip "$PUBLIC_IP" >/dev/null || die "Certificate IP mismatch."
+  openssl x509 -in "$live/cert.pem" -noout -checkend 7200 >/dev/null || die "Certificate validity is too short."
+  copy_subscription_certificate
+}
+
+write_renewal_units() {
+  cat >"$UNIT_DIR/iota-dual-renew.service" <<EOF
+[Unit]
+Description=Renew only the IOTA subscription IP certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${CONTROL} renew-cert
+LogNamespace=iota-dual
+EOF
+  cat >"$UNIT_DIR/iota-dual-renew.timer" <<'EOF'
+[Unit]
+Description=Check the IOTA subscription certificate twice daily
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=12h
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 "$UNIT_DIR/iota-dual-renew.service" "$UNIT_DIR/iota-dual-renew.timer"
+}
+
+renew_subscription_certificate() {
+  require_root
+  managed_install || die "No managed installation found."
+  [[ -x "$BASE/acme-venv/bin/certbot" && -f "$BASE/acme/config/renewal/iota-dual-ip.conf" ]] || return 0
+  # Certbot's own lock prevents overlapping renewals. Do not touch system Certbot.
+  "$BASE/acme-venv/bin/certbot" renew --quiet --cert-name iota-dual-ip \
+    --config-dir "$BASE/acme/config" --work-dir "$BASE/acme/work" \
+    --logs-dir "$BASE/acme/logs" --max-log-backups 7 \
+    --deploy-hook "$CONTROL deploy-cert"
+}
+
+setup_maintenance() {
+  local unit directory
+  install -d -m 755 "$(dirname "$JOURNAL_CONFIG")"
+  cat >"$JOURNAL_CONFIG" <<'EOF'
+# Managed by iota-dual-test-v1; applies ONLY to its journal namespace.
+[Journal]
+Storage=persistent
+SystemMaxUse=100M
+RuntimeMaxUse=50M
+SystemMaxFileSize=16M
+SystemKeepFree=256M
+MaxRetentionSec=7day
+MaxFileSec=1day
+EOF
+  chmod 644 "$JOURNAL_CONFIG"
+  for unit in iota-dual-hy2 iota-dual-reality; do
+    [[ -f "$UNIT_DIR/$unit.service" ]] || continue
+    directory="$UNIT_DIR/$unit.service.d"
+    install -d -m 755 "$directory"
+    cat >"$directory/20-iota-journal.conf" <<'EOF'
+# Managed by iota-dual-test-v1
+[Service]
+LogNamespace=iota-dual
+EOF
+    chmod 644 "$directory/20-iota-journal.conf"
+  done
+  cat >"$UNIT_DIR/iota-dual-maintain.service" <<EOF
+[Unit]
+Description=Rotate only IOTA dual namespace logs, without touching network connections
+
+[Service]
+Type=oneshot
+ExecStart=${CONTROL} maintain
+Nice=19
+IOSchedulingClass=idle
+LogNamespace=iota-dual
+EOF
+  cat >"$UNIT_DIR/iota-dual-maintain.timer" <<'EOF'
+[Unit]
+Description=Daily bounded IOTA proxy log retention
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 "$UNIT_DIR/iota-dual-maintain.service" "$UNIT_DIR/iota-dual-maintain.timer"
+  systemctl daemon-reload
+  systemctl enable --now iota-dual-maintain.timer
+  log "Own logs: approximately 100 MB / 7 days, daily rotation. No memory-cache, conntrack, DNS or network flushing."
+  log "On upgrade, proxy log isolation takes effect at the next planned service start; no proxy restart was forced."
+}
+
+maintain_server() {
+  require_root
+  managed_install || die "No managed installation found."
+  log "Rotate/vacuum only the iota-dual journal namespace; old archived logs may be removed."
+  journalctl --namespace=iota-dual --rotate
+  journalctl --namespace=iota-dual --vacuum-size=100M --vacuum-time=7d
+  log "Done. No system-wide logs, active connections or memory caches were cleared."
+}
+
+diagnose_server() {
+  require_root
+  log "Read-only network/resource snapshot; not a diagnosis or a P2P stability test."
+  date -Is
+  printf '\nMemory (look at available, not just free/cache):\n'
+  free -h
+  printf '\nDisk space and inodes:\n'
+  df -h /
+  df -i /
+  printf '\nSocket summary:\n'
+  ss -s
+  printf '\nConntrack capacity, if present (not a packet-loss measure):\n'
+  sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max 2>/dev/null || true
+  printf '\nCumulative UDP counters (compare TWO snapshots; these are not percentages):\n'
+  nstat -az UdpInErrors UdpRcvbufErrors UdpSndbufErrors UdpNoPorts IpReasmFails 2>/dev/null || true
+  printf '\nRecent OOM/conntrack-full kernel events:\n'
+  journalctl -k --since '-2 hours' --no-pager 2>/dev/null | grep -Ei 'out of memory|oom-kill|killed process|nf_conntrack.*(full|drop)' | tail -n 30 || true
+  printf '\nOwn journal usage:\n'
+  journalctl --namespace=iota-dual --disk-usage 2>/dev/null || true
+  printf '\nOwn log-retention and certificate timers:\n'
+  systemctl list-timers --all --no-pager 'iota-dual-*' || true
 }
 
 make_subscription() {
@@ -542,13 +744,18 @@ PY
     useradd --system --gid iota-dual-sub --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin iota-dual-sub
   fi
   install -d -m 750 -o root -g iota-dual-sub "$BASE/subscription"
+  # Close any legacy plaintext listener before validation; never reopen HTTP.
+  if [[ -f "$UNIT_DIR/iota-dual-subscription.service" ]]; then
+    systemctl stop iota-dual-subscription.service
+  fi
+  ensure_subscription_certificate
   install -m 640 -o root -g iota-dual-sub "$EXPORT_YAML" "$BASE/subscription/clash.yaml"
   token=$(openssl rand -hex 32)
   IOTA_SUB_TOKEN="$token" python3 - "$BASE/subscription/state.json" "$PUBLIC_IP" "$SUB_PORT" "$ttl" <<'PY'
 import json, os, sys, time
 path, ip, port, ttl = sys.argv[1:]
 token = os.environ["IOTA_SUB_TOKEN"]
-state = {"public_ip": ip, "port": int(port), "token": token,
+state = {"scheme": "https", "public_ip": ip, "port": int(port), "token": token,
          "expires_at": int(time.time()) + int(ttl) * 60}
 with open(path + ".tmp", "w", encoding="utf-8") as f:
     json.dump(state, f)
@@ -558,20 +765,17 @@ PY
   chmod 640 "$BASE/subscription/state.json"
   write_subscription_program
   write_subscription_unit
-  if command -v ufw >/dev/null && LC_ALL=C ufw status | grep -q '^Status: active'; then
-    if ! LC_ALL=C ufw status | awk '{print $1, $2}' | grep -Fxq "$SUB_PORT/tcp ALLOW"; then
-      ufw allow "$SUB_PORT/tcp" comment 'iota-dual-test-subscription'
-      printf '%s/tcp\n' "$SUB_PORT" >>"$BASE/ufw-added"
-    fi
-  fi
+  write_renewal_units
+  open_managed_ufw_port "$SUB_PORT/tcp"
   systemctl daemon-reload
+  systemctl enable --now iota-dual-renew.timer
   # Do not restart either proxy. A subscription refresh only restarts this server.
   systemctl restart iota-dual-subscription.service
   probe=$(mktemp /tmp/iota-dual-sub-check.XXXXXXXX)
   for attempt in {1..5}; do
     # Pass the bearer URL through stdin, not the process argument list.
-    if curl --noproxy '*' -fsS --max-time 3 --config - -o "$probe" 2>/dev/null <<EOF
-url = "http://127.0.0.1:$SUB_PORT/$token/clash.yaml"
+    if curl --noproxy '*' -fsS --max-time 3 --connect-to "$PUBLIC_IP:$SUB_PORT:127.0.0.1:$SUB_PORT" --config - -o "$probe" 2>/dev/null <<EOF
+url = "https://$PUBLIC_IP:$SUB_PORT/$token/clash.yaml"
 EOF
     then
       break
@@ -583,7 +787,7 @@ EOF
     die "Proxy services were not changed, but subscription self-check failed. Run iota-dual status."
   fi
   rm -f -- "$probe"
-  log "Subscription passed local download verification. Provider firewall must allow TCP/$SUB_PORT."
+  log "Subscription passed HTTPS certificate/IP verification and content comparison. Provider firewall must allow TCP/$SUB_PORT and TCP/80 for certificate renewal."
   show_subscription_link
 }
 
@@ -598,10 +802,11 @@ install_server() {
   [[ -f "${BASH_SOURCE[0]}" ]] || die "Download this script to a regular file first (curl -o), then run bash on that file."
   if managed_install; then
     [[ -f "$BASE/complete" ]] || die "An incomplete installation exists. Run iota-dual status / uninstall."
-    log "Proxy services already installed. Updating subscription support only; no proxy restart or password change."
+    log "Proxy services already installed. Updating HTTPS/maintenance modules; no proxy restart or password change."
     if [[ ! "${BASH_SOURCE[0]}" -ef "$CONTROL" ]]; then
       install -m 700 -- "${BASH_SOURCE[0]}" "$CONTROL"
     fi
+    setup_maintenance
     make_subscription
     return
   fi
@@ -609,7 +814,7 @@ install_server() {
   REALITY_PORT=${VLESS_PORT:-443}
   SUB_PORT=${SUB_PORT:-18080}
   valid_port "$HY_PORT" && valid_port "$REALITY_PORT" && valid_port "$SUB_PORT" || die "Invalid port number."
-  (( SUB_PORT >= 1024 )) && [[ "$SUB_PORT" != "$REALITY_PORT" ]] || die "Subscription needs its own TCP port (1024+)."
+  (( SUB_PORT >= 1024 )) && [[ "$SUB_PORT" != "$REALITY_PORT" && "$REALITY_PORT" != 80 ]] || die "Subscription needs its own TCP port (1024+); TCP/80 is reserved for certificate validation."
   command -v ss >/dev/null || die "Missing iproute2; install it with: apt-get update && apt-get install -y iproute2"
   check_fresh_server
 
@@ -631,7 +836,7 @@ install_server() {
   log "1/7 Install dependencies (no Docker or panel)."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y --no-install-recommends ca-certificates curl openssl iproute2 python3 unzip passwd
+  apt-get install -y --no-install-recommends ca-certificates curl openssl iproute2 procps python3 unzip passwd
   TEMP_DIR=$(mktemp -d /tmp/iota-dual.XXXXXXXX)
   detect_ip
   log "2/7 Check a REALITY TLS 1.3/h2 target."
@@ -672,6 +877,7 @@ install_server() {
   "$BASE/bin/xray" run -test -c "$BASE/config/reality.json"
   write_units
   write_client_files
+  setup_maintenance
 
   log "5/7 Raise UDP buffer maximums only (never reduce existing values)."
   : >"$BASE/previous-sysctl"
@@ -706,7 +912,7 @@ install_server() {
   if ! systemctl is-active --quiet iota-dual-hy2.service ||
      ! systemctl is-active --quiet iota-dual-reality.service ||
      ! port_in_use udp "$HY_PORT" || ! port_in_use tcp "$REALITY_PORT"; then
-    journalctl -u iota-dual-hy2 -u iota-dual-reality -n 60 --no-pager >&2 || true
+    journalctl --namespace='*' -u iota-dual-hy2 -u iota-dual-reality -n 60 --no-pager >&2 || true
     die "One or both services failed. Configuration was preserved."
   fi
   printf '%s\n' "$VERSION" >"$BASE/complete"
@@ -725,7 +931,7 @@ show_config() {
 
 status_server() {
   require_root
-  log "IOTA dual test status (no credentials printed)"
+  log "IOTA dual test controller ${VERSION} status (no credentials printed)"
   date -Is
   for service in iota-dual-hy2 iota-dual-reality iota-dual-subscription; do
     printf '\n%s\n' "$service"
@@ -734,11 +940,11 @@ status_server() {
   printf '\nListeners owned by test services:\n'
   ss -lntup | grep -E 'hysteria|xray' || true
   printf '\nRecent service logs (review IP addresses before sharing):\n'
-  journalctl -u iota-dual-hy2 -u iota-dual-reality -u iota-dual-subscription --since '-15 min' --no-pager -n 60 || true
+  journalctl --namespace='*' -u iota-dual-hy2 -u iota-dual-reality -u iota-dual-subscription --since '-15 min' --no-pager -n 60 || true
 }
 
 uninstall_server() {
-  local answer backup candidate old_value current installed
+  local answer backup candidate old_value current installed unit
   require_root
   managed_install || die "Managed marker missing. Refusing to delete any files."
   [[ ! -L "$BASE/config" ]] || die "Unexpected config symlink. Refusing to delete."
@@ -750,9 +956,16 @@ uninstall_server() {
   # Abort before stopping services if the recoverable backup cannot be made.
   cp -a "$BASE" "$backup/"
   for candidate in "$EXPORT_INFO" "$EXPORT_YAML" "$SYSCTL_FILE" "$CONTROL" \
-    "$UNIT_DIR/iota-dual-hy2.service" "$UNIT_DIR/iota-dual-reality.service"; do
+    "$UNIT_DIR/iota-dual-hy2.service" "$UNIT_DIR/iota-dual-reality.service" \
+    "$UNIT_DIR/iota-dual-renew.service" "$UNIT_DIR/iota-dual-renew.timer" \
+    "$UNIT_DIR/iota-dual-maintain.service" "$UNIT_DIR/iota-dual-maintain.timer" "$JOURNAL_CONFIG"; do
     [[ ! -f "$candidate" ]] || cp -a "$candidate" "$backup/"
   done
+  systemctl disable --now iota-dual-renew.timer iota-dual-maintain.timer 2>/dev/null || true
+  systemctl stop iota-dual-renew.service iota-dual-maintain.service 2>/dev/null || true
+  if systemctl is-active --quiet iota-dual-renew.service; then
+    die "Certificate renewal is still running. Files were not deleted."
+  fi
   if [[ -f "$UNIT_DIR/iota-dual-subscription.service" ]]; then
     cp -a "$UNIT_DIR/iota-dual-subscription.service" "$backup/"
     systemctl stop iota-dual-subscription.service || die "Could not stop the subscription server."
@@ -781,6 +994,17 @@ uninstall_server() {
   fi
   rm -f -- "$UNIT_DIR/iota-dual-hy2.service" "$UNIT_DIR/iota-dual-reality.service"
   rm -f -- "$UNIT_DIR/iota-dual-subscription.service"
+  rm -f -- "$UNIT_DIR/iota-dual-renew.service" "$UNIT_DIR/iota-dual-renew.timer"
+  rm -f -- "$UNIT_DIR/iota-dual-maintain.service" "$UNIT_DIR/iota-dual-maintain.timer"
+  rm -f -- "$JOURNAL_CONFIG"
+  rmdir -- "$(dirname "$JOURNAL_CONFIG")" 2>/dev/null || true
+  for unit in iota-dual-hy2 iota-dual-reality; do
+    if [[ -f "$UNIT_DIR/$unit.service.d/20-iota-journal.conf" ]]; then
+      cp -a "$UNIT_DIR/$unit.service.d/20-iota-journal.conf" "$backup/$unit-journal.conf"
+      rm -f -- "$UNIT_DIR/$unit.service.d/20-iota-journal.conf"
+      rmdir -- "$UNIT_DIR/$unit.service.d" 2>/dev/null || true
+    fi
+  done
   rm -f -- "$SYSCTL_FILE" "$EXPORT_YAML" "$EXPORT_INFO" "$CONTROL"
   rm -rf -- /opt/iota-dual
   systemctl daemon-reload
@@ -808,8 +1032,12 @@ main() {
     status) status_server ;;
     show) show_config ;;
     subscribe) make_subscription ;;
+    renew-cert) renew_subscription_certificate ;;
+    deploy-cert) copy_subscription_certificate ;;
+    maintain) maintain_server ;;
+    diagnose) diagnose_server ;;
     uninstall) uninstall_server ;;
-    *) die 'Usage: iota-dual [install|status|show|subscribe|uninstall]' ;;
+    *) die 'Usage: iota-dual [install|status|show|subscribe|diagnose|maintain|renew-cert|uninstall]' ;;
   esac
 }
 
