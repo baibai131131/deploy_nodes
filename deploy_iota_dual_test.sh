@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # IOTA dual-protocol test VPS: Hysteria2/UDP + VLESS-REALITY/TCP.
-# No Docker, web panel, public subscription server, or third-party monitor.
+# No Docker, web panel, or third-party monitor. Short-lived HTTP subscription.
 # Fresh Ubuntu 22.04/24.04; amd64/arm64. English terminal output.
 set -Eeuo pipefail
 umask 077
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 HY_VERSION="2.13.0"
 XR_VERSION="26.10.31"
 BASE="/opt/iota-dual"
@@ -101,7 +101,8 @@ detect_ip() {
 check_fresh_server() {
   local candidate
   for candidate in "$BASE" "$CONTROL" "$EXPORT_YAML" "$EXPORT_INFO" "$SYSCTL_FILE" \
-    "$UNIT_DIR/iota-dual-hy2.service" "$UNIT_DIR/iota-dual-reality.service"; do
+    "$UNIT_DIR/iota-dual-hy2.service" "$UNIT_DIR/iota-dual-reality.service" \
+    "$UNIT_DIR/iota-dual-subscription.service"; do
     [[ ! -e "$candidate" && ! -L "$candidate" ]] || die "Existing file: $candidate. No files were overwritten."
   done
   # Do not stop, remove, or overwrite an existing proxy/panel.
@@ -110,8 +111,12 @@ check_fresh_server() {
   done
   port_in_use udp "$HY_PORT" && die "UDP/$HY_PORT is occupied; no services were stopped."
   port_in_use tcp "$REALITY_PORT" && die "TCP/$REALITY_PORT is occupied; no services were stopped."
+  port_in_use tcp "$SUB_PORT" && die "TCP/$SUB_PORT is occupied; subscription port is not available."
   if getent passwd iota-dual >/dev/null || getent group iota-dual >/dev/null; then
     die "The iota-dual account/group already exists. Refusing to reuse it."
+  fi
+  if getent passwd iota-dual-sub >/dev/null || getent group iota-dual-sub >/dev/null; then
+    die "The iota-dual-sub account/group already exists. Refusing to reuse it."
   fi
   return 0
 }
@@ -303,7 +308,8 @@ Hysteria ${HY_VERSION}; Xray ${XR_VERSION}
 Server: ${PUBLIC_IP}
 HY2: UDP/${HY_PORT}; REALITY: TCP/${REALITY_PORT}
 
-Clash/Mihomo: download ${EXPORT_YAML} over SSH/SFTP and import as a local profile.
+Clash/Mihomo: copy the temporary subscription URL printed below.
+Or download ${EXPORT_YAML} over SSH/SFTP and import as a local profile.
 Preserve your working DNS/TUN settings or merge only the two proxies.
 Use a recent Clash Verge Rev/Mihomo core (1.19.20+ for certificate pin support).
 Select IOTA-HY2-UDP normally; select IOTA-REALITY-TCP if HY2 is unreachable.
@@ -323,11 +329,262 @@ Two protocols on one VPS do NOT protect against VPS/IP/network outages.
 
 Status:      iota-dual status
 Show config: iota-dual show
+New URL:     iota-dual subscribe
 HY2 log:     journalctl -u iota-dual-hy2 -f
 REALITY log: journalctl -u iota-dual-reality -f
 Uninstall:   iota-dual uninstall
 EOF
   chmod 600 "$EXPORT_YAML" "$EXPORT_INFO"
+}
+
+write_subscription_program() {
+  cat >"$BASE/subscription_server.py" <<'PY'
+#!/usr/bin/env python3
+"""Serve exactly one token-protected YAML file, until its fixed expiry time.
+
+This is HTTP, not HTTPS: the random path is a bearer secret, NOT encryption.
+No directory listing, arbitrary file paths, access logs, uploads, or redirects.
+"""
+import argparse
+import hmac
+import json
+from pathlib import Path
+import re
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+
+def serve(directory, bind):
+    root = Path(directory)
+    state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+    token = state["token"]
+    expires_at = int(state["expires_at"])
+    port = int(state["port"])
+    if not re.fullmatch(r"[0-9a-f]{64}", token) or not 1024 <= port <= 65535:
+        raise ValueError("Invalid subscription settings")
+    if time.time() >= expires_at:
+        return
+    payload = (root / "clash.yaml").read_bytes()
+    if not payload or len(payload) > 262144:
+        raise ValueError("Invalid subscription file size")
+    expected = f"/{token}/clash.yaml"
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "IOTA-Subscription"
+        sys_version = ""
+
+        def log_message(self, *_args):
+            pass  # Never store request paths or bearer tokens in access logs.
+
+        def handle_request(self, head=False):
+            path = urlsplit(self.path).path
+            valid = hmac.compare_digest(path.encode("utf-8"), expected.encode("ascii"))
+            valid = valid and time.time() < expires_at
+            body = payload if valid else b"Not found\n"
+            self.send_response(200 if valid else 404)
+            self.send_header("Content-Type", "application/yaml; charset=utf-8" if valid else "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            if valid:
+                self.send_header("Content-Disposition", 'inline; filename="IOTA-DUAL.yaml"')
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
+            self.close_connection = True
+
+        def do_GET(self):
+            self.handle_request()
+
+        def do_HEAD(self):
+            self.handle_request(head=True)
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+        request_queue_size = 32
+
+        def __init__(self, *args, **kwargs):
+            self.slots = threading.BoundedSemaphore(16)
+            super().__init__(*args, **kwargs)
+
+        def get_request(self):
+            connection, address = super().get_request()
+            connection.settimeout(5)
+            return connection, address
+
+        def process_request(self, request, client_address):
+            if not self.slots.acquire(blocking=False):
+                self.shutdown_request(request)
+                return
+            try:
+                super().process_request(request, client_address)
+            except BaseException:
+                self.slots.release()
+                raise
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self.slots.release()
+
+        def handle_error(self, _request, _client_address):
+            pass  # Do not log request context or tokens on malformed requests.
+
+    with Server((bind, port), Handler) as server:
+        server.timeout = 1
+        while time.time() < expires_at:
+            server.handle_request()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("directory")
+    parser.add_argument("--bind", default="0.0.0.0")
+    args = parser.parse_args()
+    serve(args.directory, args.bind)
+PY
+  chmod 644 "$BASE/subscription_server.py"
+}
+
+write_subscription_unit() {
+  cat >"$UNIT_DIR/iota-dual-subscription.service" <<EOF
+[Unit]
+Description=IOTA short-lived private-path HTTP subscription
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=iota-dual-sub
+Group=iota-dual-sub
+ExecStart=/usr/bin/python3 ${BASE}/subscription_server.py ${BASE}/subscription
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StandardOutput=null
+StandardError=journal
+EOF
+  chmod 644 "$UNIT_DIR/iota-dual-subscription.service"
+}
+
+show_subscription_link() {
+  [[ -f "$BASE/subscription/state.json" ]] || return 0
+  python3 - "$BASE/subscription/state.json" <<'PY'
+import datetime, json, sys, time
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+if time.time() >= state["expires_at"]:
+    print("Subscription URL expired. Run: iota-dual subscribe")
+else:
+    print("\n===== COPY THIS CLASH SUBSCRIPTION URL =====")
+    print(f'http://{state["public_ip"]}:{state["port"]}/{state["token"]}/clash.yaml')
+    expiry = datetime.datetime.fromtimestamp(state["expires_at"], datetime.timezone.utc)
+    print("Expires:", expiry.isoformat())
+    print("HTTP IS NOT ENCRYPTED. Keep this URL private; prefer SSH/SFTP or HTTPS on untrusted networks.")
+    print("Imported proxy nodes continue working after the subscription URL expires.")
+PY
+}
+
+make_subscription() {
+  local ttl old_port token probe attempt
+  require_root
+  managed_install || die "No managed dual installation found."
+  [[ -f "$BASE/complete" && -f "$EXPORT_YAML" ]] || die "Finish proxy installation before creating a subscription."
+  [[ ! -L "$BASE/subscription" ]] || die "Unexpected subscription directory symlink."
+  SUB_PORT=${SUB_PORT:-18080}
+  ttl=${SUB_TTL_MINUTES:-30}
+  valid_port "$SUB_PORT" && (( SUB_PORT >= 1024 )) || die "SUB_PORT must be 1024-65535."
+  [[ "$ttl" =~ ^[1-9][0-9]?$ ]] && (( ttl >= 5 && ttl <= 60 )) || die "SUB_TTL_MINUTES must be 5-60."
+  if port_in_use tcp "$SUB_PORT"; then
+    old_port=0
+    if [[ -f "$BASE/subscription/state.json" ]]; then
+      old_port=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$BASE/subscription/state.json")
+    fi
+    [[ "$old_port" == "$SUB_PORT" ]] && systemctl is-active --quiet iota-dual-subscription.service ||
+      die "TCP/$SUB_PORT is occupied by another service. Set SUB_PORT to a free port."
+  fi
+  # Read only the known generated server lines; no eval and no wallet access.
+  PUBLIC_IP=$(python3 - "$EXPORT_YAML" <<'PY'
+import ipaddress, re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+hosts = re.findall(r"^    server: ([0-9.]+)$", text, re.M)
+if len(hosts) != 2 or len(set(hosts)) != 1:
+    raise SystemExit("Expected two generated nodes on one IPv4 server")
+ip = ipaddress.ip_address(hosts[0])
+if ip.version != 4 or not ip.is_global:
+    raise SystemExit("Expected public IPv4")
+print(ip)
+PY
+)
+  if [[ ! -f "$BASE/subscription-account-created" ]]; then
+    if getent passwd iota-dual-sub >/dev/null || getent group iota-dual-sub >/dev/null; then
+      die "Unmanaged subscription account/group exists. Refusing to reuse it."
+    fi
+    groupadd --system iota-dual-sub
+    touch "$BASE/subscription-account-created"
+  fi
+  if ! getent passwd iota-dual-sub >/dev/null; then
+    useradd --system --gid iota-dual-sub --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin iota-dual-sub
+  fi
+  install -d -m 750 -o root -g iota-dual-sub "$BASE/subscription"
+  install -m 640 -o root -g iota-dual-sub "$EXPORT_YAML" "$BASE/subscription/clash.yaml"
+  token=$(openssl rand -hex 32)
+  IOTA_SUB_TOKEN="$token" python3 - "$BASE/subscription/state.json" "$PUBLIC_IP" "$SUB_PORT" "$ttl" <<'PY'
+import json, os, sys, time
+path, ip, port, ttl = sys.argv[1:]
+token = os.environ["IOTA_SUB_TOKEN"]
+state = {"public_ip": ip, "port": int(port), "token": token,
+         "expires_at": int(time.time()) + int(ttl) * 60}
+with open(path + ".tmp", "w", encoding="utf-8") as f:
+    json.dump(state, f)
+os.replace(path + ".tmp", path)
+PY
+  chown root:iota-dual-sub "$BASE/subscription/state.json"
+  chmod 640 "$BASE/subscription/state.json"
+  write_subscription_program
+  write_subscription_unit
+  if command -v ufw >/dev/null && LC_ALL=C ufw status | grep -q '^Status: active'; then
+    if ! LC_ALL=C ufw status | awk '{print $1, $2}' | grep -Fxq "$SUB_PORT/tcp ALLOW"; then
+      ufw allow "$SUB_PORT/tcp" comment 'iota-dual-test-subscription'
+      printf '%s/tcp\n' "$SUB_PORT" >>"$BASE/ufw-added"
+    fi
+  fi
+  systemctl daemon-reload
+  # Do not restart either proxy. A subscription refresh only restarts this server.
+  systemctl restart iota-dual-subscription.service
+  probe=$(mktemp /tmp/iota-dual-sub-check.XXXXXXXX)
+  for attempt in {1..5}; do
+    # Pass the bearer URL through stdin, not the process argument list.
+    if curl --noproxy '*' -fsS --max-time 3 --config - -o "$probe" 2>/dev/null <<EOF
+url = "http://127.0.0.1:$SUB_PORT/$token/clash.yaml"
+EOF
+    then
+      break
+    fi
+    sleep 1
+  done
+  if ! cmp -s "$EXPORT_YAML" "$probe"; then
+    rm -f -- "$probe"
+    die "Proxy services were not changed, but subscription self-check failed. Run iota-dual status."
+  fi
+  rm -f -- "$probe"
+  log "Subscription passed local download verification. Provider firewall must allow TCP/$SUB_PORT."
+  show_subscription_link
 }
 
 install_server() {
@@ -341,13 +598,18 @@ install_server() {
   [[ -f "${BASH_SOURCE[0]}" ]] || die "Download this script to a regular file first (curl -o), then run bash on that file."
   if managed_install; then
     [[ -f "$BASE/complete" ]] || die "An incomplete installation exists. Run iota-dual status / uninstall."
-    log "Already installed. Existing credentials/configuration were NOT changed."
-    show_config
+    log "Proxy services already installed. Updating subscription support only; no proxy restart or password change."
+    if [[ ! "${BASH_SOURCE[0]}" -ef "$CONTROL" ]]; then
+      install -m 700 -- "${BASH_SOURCE[0]}" "$CONTROL"
+    fi
+    make_subscription
     return
   fi
   HY_PORT=${HY2_PORT:-443}
   REALITY_PORT=${VLESS_PORT:-443}
-  valid_port "$HY_PORT" && valid_port "$REALITY_PORT" || die "Invalid port number."
+  SUB_PORT=${SUB_PORT:-18080}
+  valid_port "$HY_PORT" && valid_port "$REALITY_PORT" && valid_port "$SUB_PORT" || die "Invalid port number."
+  (( SUB_PORT >= 1024 )) && [[ "$SUB_PORT" != "$REALITY_PORT" ]] || die "Subscription needs its own TCP port (1024+)."
   command -v ss >/dev/null || die "Missing iproute2; install it with: apt-get update && apt-get install -y iproute2"
   check_fresh_server
 
@@ -450,7 +712,7 @@ install_server() {
   printf '%s\n' "$VERSION" >"$BASE/complete"
   INSTALL_DONE=1
   log "Both local services/listeners are running. End-to-end IOTA testing is still required."
-  show_config
+  make_subscription
 }
 
 show_config() {
@@ -458,23 +720,21 @@ show_config() {
   managed_install || die "No managed IOTA dual test installation found."
   [[ -f "$EXPORT_INFO" && -f "$EXPORT_YAML" ]] || die "Client files are missing; installation may be incomplete."
   cat "$EXPORT_INFO"
-  printf '\n----- BEGIN PRIVATE CLASH YAML -----\n'
-  cat "$EXPORT_YAML"
-  printf '\n----- END PRIVATE CLASH YAML -----\n'
+  show_subscription_link
 }
 
 status_server() {
   require_root
   log "IOTA dual test status (no credentials printed)"
   date -Is
-  for service in iota-dual-hy2 iota-dual-reality; do
+  for service in iota-dual-hy2 iota-dual-reality iota-dual-subscription; do
     printf '\n%s\n' "$service"
     systemctl show "$service" -p ActiveState -p SubState -p NRestarts -p ExecMainStatus || true
   done
   printf '\nListeners owned by test services:\n'
   ss -lntup | grep -E 'hysteria|xray' || true
   printf '\nRecent service logs (review IP addresses before sharing):\n'
-  journalctl -u iota-dual-hy2 -u iota-dual-reality --since '-15 min' --no-pager -n 60 || true
+  journalctl -u iota-dual-hy2 -u iota-dual-reality -u iota-dual-subscription --since '-15 min' --no-pager -n 60 || true
 }
 
 uninstall_server() {
@@ -493,6 +753,10 @@ uninstall_server() {
     "$UNIT_DIR/iota-dual-hy2.service" "$UNIT_DIR/iota-dual-reality.service"; do
     [[ ! -f "$candidate" ]] || cp -a "$candidate" "$backup/"
   done
+  if [[ -f "$UNIT_DIR/iota-dual-subscription.service" ]]; then
+    cp -a "$UNIT_DIR/iota-dual-subscription.service" "$backup/"
+    systemctl stop iota-dual-subscription.service || die "Could not stop the subscription server."
+  fi
   # Missing units are expected after a partial install. Never delete files
   # while an installed unit is still active.
   systemctl disable --now iota-dual-hy2.service iota-dual-reality.service 2>/dev/null || true
@@ -516,6 +780,7 @@ uninstall_server() {
     done <"$BASE/previous-sysctl"
   fi
   rm -f -- "$UNIT_DIR/iota-dual-hy2.service" "$UNIT_DIR/iota-dual-reality.service"
+  rm -f -- "$UNIT_DIR/iota-dual-subscription.service"
   rm -f -- "$SYSCTL_FILE" "$EXPORT_YAML" "$EXPORT_INFO" "$CONTROL"
   rm -rf -- /opt/iota-dual
   systemctl daemon-reload
@@ -524,6 +789,14 @@ uninstall_server() {
   fi
   if getent group iota-dual >/dev/null; then
     groupdel iota-dual || warn "The service group could not be removed."
+  fi
+  if [[ -f "$backup/iota-dual/subscription-account-created" ]]; then
+    if getent passwd iota-dual-sub >/dev/null; then
+      userdel iota-dual-sub || warn "The subscription account could not be removed."
+    fi
+    if getent group iota-dual-sub >/dev/null; then
+      groupdel iota-dual-sub || warn "The subscription group could not be removed."
+    fi
   fi
   log "Removed this test installation. Recoverable backup: $backup"
   warn "The private backup contains credentials. Keep it private or remove it after verification."
@@ -534,8 +807,9 @@ main() {
     install) install_server ;;
     status) status_server ;;
     show) show_config ;;
+    subscribe) make_subscription ;;
     uninstall) uninstall_server ;;
-    *) die 'Usage: iota-dual [install|status|show|uninstall]' ;;
+    *) die 'Usage: iota-dual [install|status|show|subscribe|uninstall]' ;;
   esac
 }
 
