@@ -1,10 +1,14 @@
 """Offline configuration/preflight tests; never install or start a real proxy."""
 import json
+import http.client
 import os
 from pathlib import Path
+import socket
 import subprocess
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
@@ -127,6 +131,128 @@ write_client_files
                 self.assertIn("Restart=on-failure", unit)
                 self.assertIn("ProtectSystem=strict", unit)
                 self.assertNotIn("User=root", unit)
+
+
+class SubscriptionTests(unittest.TestCase):
+    """Real loopback HTTP tests; do not bind publicly or invoke systemd."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temp.name)
+        cls.token = "a" * 64
+        cls.payload = b"proxies:\n  - name: test\n    type: direct\n"
+        result = bash('BASE="$TEST_DIR"\nwrite_subscription_program', TEST_DIR=cls.temp.name)
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+        cls.program = cls.root / "subscription_server.py"
+        compile(cls.program.read_text(), str(cls.program), "exec")
+        (cls.root / "clash.yaml").write_bytes(cls.payload)
+        cls.port, cls.process = cls.launch(cls.root, time.time() + 60)
+        for _ in range(100):
+            try:
+                cls.request(f"/{cls.token}/clash.yaml")
+                break
+            except OSError:
+                time.sleep(0.02)
+        else:
+            cls.process.terminate()
+            raise RuntimeError(cls.process.communicate(timeout=2))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.process.terminate()
+        stdout, stderr = cls.process.communicate(timeout=3)
+        if cls.token in stdout + stderr:
+            raise AssertionError("Bearer token leaked into server logs")
+        cls.temp.cleanup()
+
+    @classmethod
+    def launch(cls, directory, expires):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        state = {"public_ip": "8.8.8.8", "port": port,
+                 "expires_at": int(expires), "token": cls.token}
+        (directory / "state.json").write_text(json.dumps(state))
+        process = subprocess.Popen(
+            ["python3", str(cls.program), str(directory), "--bind", "127.0.0.1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        return port, process
+
+    @classmethod
+    def request(cls, path, method="GET", port=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port or cls.port, timeout=2)
+        try:
+            connection.request(method, path)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def test_exact_subscription(self):
+        status, headers, body = self.request(f"/{self.token}/clash.yaml")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.payload)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertIn("application/yaml", headers["Content-Type"])
+
+    def test_head(self):
+        status, headers, body = self.request(f"/{self.token}/clash.yaml", "HEAD")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+        self.assertEqual(int(headers["Content-Length"]), len(self.payload))
+
+    def test_only_exact_path_is_available(self):
+        paths = ["/", "/clash.yaml", "/wrong/clash.yaml", "/state.json",
+                 "/../config/reality.json", "/%2e%2e/config/reality.json",
+                 f"/{self.token}/state.json", f"/{self.token}/../state.json"]
+        for path in paths:
+            with self.subTest(path=path):
+                status, _, body = self.request(path)
+                self.assertEqual(status, 404)
+                self.assertNotIn(self.payload, body)
+                self.assertNotIn(self.token.encode(), body)
+
+    def test_no_upload_method(self):
+        self.assertEqual(self.request(f"/{self.token}/clash.yaml", "POST")[0], 501)
+
+    def test_multiple_imports(self):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            replies = list(executor.map(lambda _: self.request(f"/{self.token}/clash.yaml")[0], range(16)))
+        self.assertEqual(replies, [200] * 16)
+
+    def test_expired_server_does_not_start(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "clash.yaml").write_bytes(self.payload)
+            _, process = self.launch(root, time.time() - 1)
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertNotIn(self.token, stdout + stderr)
+
+    def test_server_closes_at_expiry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "clash.yaml").write_bytes(self.payload)
+            port, process = self.launch(root, time.time() + 2)
+            try:
+                for _ in range(100):
+                    try:
+                        status, _, _ = self.request(f"/{self.token}/clash.yaml", port=port)
+                        break
+                    except OSError:
+                        time.sleep(0.01)
+                self.assertEqual(status, 200)
+                process.communicate(timeout=4)
+                self.assertEqual(process.returncode, 0)
+                with self.assertRaises(OSError):
+                    self.request(f"/{self.token}/clash.yaml", port=port)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.communicate(timeout=2)
 
 
 if __name__ == "__main__":
